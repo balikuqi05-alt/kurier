@@ -1,7 +1,24 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="110" fill="#d71920"/>
-  <path d="M256 92c-70 0-126 55-126 124 0 92 126 204 126 204s126-112 126-204c0-69-56-124-126-124z" fill="#fff"/>
-  <path d="M256 150l-52 104h104z" fill="#f6c343"/>
-  <circle cx="242" cy="218" r="9" fill="#c0392b"/>
-  <circle cx="266" cy="238" r="8" fill="#c0392b"/>
+  <!-- Subito-Grün, randlos (iOS/Android runden die Ecken selbst) -->
+  <rect width="512" height="512" fill="#8DDD58"/>
+  <!-- Tempo-Striche -->
+  <g fill="#14210F">
+    <rect x="34" y="214" width="54" height="13" rx="6.5"/>
+    <rect x="18" y="246" width="70" height="13" rx="6.5"/>
+    <rect x="40" y="278" width="48" height="13" rx="6.5"/>
+  </g>
+  <!-- Auto (Seitenansicht, fährt nach rechts) -->
+  <path fill="#14210F" d="M104 300 Q104 262 140 256 L176 250 L218 190 Q228 176 246 176 L330 176 Q346 176 356 188 L404 248 L430 252 Q462 258 462 292 L462 318 Q462 336 444 336 L104 336 Z"/>
+  <!-- Fenster -->
+  <path fill="#8DDD58" d="M232 196 L284 196 L284 246 L198 246 Z"/>
+  <path fill="#8DDD58" d="M300 196 L330 196 Q340 196 346 204 L380 246 L300 246 Z"/>
+  <!-- Räder -->
+  <circle cx="178" cy="338" r="54" fill="#8DDD58"/>
+  <circle cx="386" cy="338" r="54" fill="#8DDD58"/>
+  <circle cx="178" cy="338" r="42" fill="#14210F"/>
+  <circle cx="386" cy="338" r="42" fill="#14210F"/>
+  <circle cx="178" cy="338" r="15" fill="#8DDD58"/>
+  <circle cx="386" cy="338" r="15" fill="#8DDD58"/>
+  <!-- Schriftzug -->
+  <text x="256" y="452" text-anchor="middle" font-family="Archivo, 'Arial Black', sans-serif" font-weight="900" font-size="78" letter-spacing="3" fill="#14210F" font-style="italic">SUBITO</text>
 </svg>
