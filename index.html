@@ -17,7 +17,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100..125,400..900&display=swap">
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=6">
 </head>
 <body>
   <header class="top">
@@ -29,6 +29,14 @@
     <section id="view-tour" class="view active" aria-label="Tour"></section>
     <section id="view-karte" class="view" aria-label="Karte">
       <div id="map"></div>
+      <div class="mapsearch">
+        <form id="mapSearch" autocomplete="off">
+          <input id="mapQ" type="search" placeholder="Adresse suchen…" enterkeyhint="search" aria-label="Adresse suchen">
+          <button type="submit" aria-label="Suchen"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg></button>
+        </form>
+        <div id="mapResults" class="results" hidden></div>
+      </div>
+      <div id="liveBar" class="livebar" hidden></div>
       <div id="pickbar" class="pickbar" hidden></div>
       <div id="mapStyles" class="seg">
         <button type="button" data-style="3D">3D</button>
@@ -36,9 +44,11 @@
         <button type="button" data-style="Schweiz">Schweiz</button>
       </div>
       <div class="mapctl">
+        <button class="fab live" id="btnLive" type="button" aria-label="Live-Modus">LIVE</button>
         <button class="fab" id="btnMe" type="button" aria-label="Meine Position">◎</button>
         <button class="fab" id="btnFit" type="button" aria-label="Ganze Tour zeigen">⤢</button>
       </div>
+      <div id="mapSheet" class="sheet"></div>
     </section>
     <section id="view-kunden" class="view" aria-label="Kunden"></section>
     <section id="view-schicht" class="view" aria-label="Schicht"></section>
@@ -57,6 +67,6 @@
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-  <script src="app.js"></script>
+  <script src="app.js?v=6"></script>
 </body>
 </html>
