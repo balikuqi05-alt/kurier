@@ -1,5 +1,5 @@
 // Offline-Speicher für die App-Hülle. Karten-Kacheln und Adresssuche brauchen Internet.
-const CACHE = 'kurier-v4';
+const CACHE = 'kurier-v5';
 const SHELL = [
   './', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest', 'icon.svg', 'subito-logo.png', 'icon-192.png', 'apple-touch-icon.png',
   'https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css',

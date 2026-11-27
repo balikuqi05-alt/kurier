@@ -488,7 +488,7 @@ function renderTour() {
       <button class="btn primary big" data-act="scan" type="button">📷 Scannen</button>
       <button class="btn" data-act="add" type="button">＋ Von Hand</button>
     </div>
-    ${open.length ? `<button class="btn ok block mt big" data-act="go" type="button">🚗 Los – Navi zum 1. Stopp</button>` : ''}
+    ${open.length ? `<button class="btn dark block mt big" data-act="go" type="button">🚗 Los – Navi zum 1. Stopp</button>` : ''}
     ${open.length && !lastRoute ? '<button class="btn block mt" data-act="opt" type="button">⚡ Route berechnen</button>' : ''}
     ${open.length ? `<ol class="stops">${open.map((o, i) => stopCard(o, i + 1)).join('')}</ol>`
       : '<div class="empty">Keine offenen Bestellungen.<br>Tippe auf „＋ Bestellung“ oder fotografiere den Zettel.</div>'}
@@ -605,7 +605,7 @@ function scanDialog() {
     <p class="hint" id="sRoute"></p>
     <div class="foot">
       <button class="btn" value="cancel" type="submit">Fertig</button>
-      <button class="btn ok" id="sGo" type="button" disabled>🚗 Los</button>
+      <button class="btn dark" id="sGo" type="button" disabled>🚗 Los</button>
     </div>`);
   const list = $('#sList', d), go = $('#sGo', d), routeInfo = $('#sRoute', d);
   let busy = 0, added = 0;
@@ -945,7 +945,7 @@ const MAP_STYLES = {
   'Satellit': 'https://vectortiles.geo.admin.ch/styles/ch.swisstopo.imagerybasemap.vt/style.json',
   'Schweiz': 'https://vectortiles.geo.admin.ch/styles/ch.swisstopo.basemap.vt/style.json'
 };
-const NEON = '#39d01a';
+const NEON = '#8DDD58';
 let map = null, meMarker = null, pick = null, watchId = null, pins = [];
 
 function initMap() {
@@ -1007,7 +1007,7 @@ function drawRouteNow() {
   map.addLayer({ id: 'route-glow', type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' },
     paint: { 'line-color': NEON, 'line-width': 16, 'line-opacity': 0.25, 'line-blur': 6 } });
   map.addLayer({ id: 'route-casing', type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' },
-    paint: { 'line-color': '#0d2a06', 'line-width': 8 } });
+    paint: { 'line-color': '#14210F', 'line-width': 8 } });
   map.addLayer({ id: 'route-line', type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' },
     paint: { 'line-color': NEON, 'line-width': 5 } });
 }
