@@ -109,6 +109,19 @@ async function nominatim(params) {
 // Sucht die Adresse in mehreren Varianten (Schreibfehler wie Kantonstrasse/Kantonsstrasse).
 // Ergebnis {lat,lng,approx}: approx = nur Strasse oder nur Ort gefunden → Punkt prüfen.
 async function geocode(street, plz, ort) {
+  // Schnell zuerst: Photon (keine Wartezeit). Nur übernehmen, wenn die Hausnummer genau stimmt.
+  try {
+    const b = db.settings.base || { lat: 46.96, lng: 9.56 };
+    const r = await fetch(`https://photon.komoot.io/api/?q=${enc([street, [plz, ort].filter(Boolean).join(' ')].filter(Boolean).join(', '))}&limit=4&lang=de&lat=${b.lat}&lon=${b.lng}`);
+    const j = await r.json();
+    const hn = ((street || '').match(/(\d+\s?[a-z]?)\s*$/i) || ['', ''])[1].replace(/\s/g, '').toLowerCase();
+    const f = (j.features || []).find(x => {
+      const p = x.properties || {};
+      return p.countrycode === 'CH' && hn && String(p.housenumber || '').toLowerCase() === hn &&
+        (!plz || p.postcode === plz) && norm(p.street || p.name || '').slice(0, 5) === norm(street).slice(0, 5);
+    });
+    if (f) return { lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0], approx: false };
+  } catch (e) { /* weiter mit Nominatim */ }
   const town = ort.replace(/ (Dorf|Pardisla|Fabriken)$/, '').replace(/^Seewis-Schmitten$/, 'Seewis im Prättigau');
   const place = [plz, town].filter(Boolean).join(' ');
   const variants = [...new Set([street,
@@ -319,11 +332,11 @@ async function osrmTable(pts) {
   const j = await r.json(); if (j.code !== 'Ok') throw new Error(j.code);
   return j.durations.map(row => row.map(v => v == null ? 1e6 : v));
 }
-async function osrmRoute(pts) {
-  const r = await fetch(`https://router.project-osrm.org/route/v1/driving/${osrmCoords(pts)}?overview=full&geometries=geojson`);
+async function osrmRoute(pts, steps) {
+  const r = await fetch(`https://router.project-osrm.org/route/v1/driving/${osrmCoords(pts)}?overview=full&geometries=geojson${steps ? '&steps=true' : ''}`);
   const j = await r.json(); if (j.code !== 'Ok') throw new Error(j.code);
   const rt = j.routes[0];
-  return { geo: rt.geometry, legs: rt.legs.map(l => l.duration), legDist: rt.legs.map(l => l.distance), dist: rt.distance, dur: rt.duration };
+  return { geo: rt.geometry, legs: rt.legs.map(l => l.duration), legDist: rt.legs.map(l => l.distance), dist: rt.distance, dur: rt.duration, steps: steps ? rt.legs[0].steps : null };
 }
 
 // Beste Reihenfolge: zuerst so wenig Verspätung wie möglich, dann so wenig Fahrzeit wie möglich.
@@ -486,7 +499,7 @@ function renderTour() {
     ${lastRoute && open.length ? `<p class="hint">Route: ca. ${Math.round(lastRoute.dur * driveFactor() / 60)} Min · ${(lastRoute.dist / 1000).toFixed(1)} km${db.learn?.driveN ? ` · gelernt: du fährst ${Math.round((driveFactor() - 1) * 100) >= 0 ? '+' : ''}${Math.round((driveFactor() - 1) * 100)} % gegenüber Berechnung` : ''}</p>
 ` : ''}
     <div class="row">
-      <button class="btn primary big" data-act="scan" type="button">📷 Scannen</button>
+      <label class="btn primary big">📷 Scannen<input type="file" accept="image/*" capture="environment" data-quickscan hidden></label>
       <button class="btn" data-act="add" type="button">＋ Von Hand</button>
     </div>
     ${open.length ? `<button class="btn dark block mt big" data-act="go" type="button">🚗 Los – Navi zum 1. Stopp</button>` : ''}
@@ -525,7 +538,7 @@ function stopCard(o, n) {
     </div>
     ${o.done ? '' : `<div class="actions">
       <div class="arow">
-        ${t ? `<a class="btn" href="${navUrl(t)}" target="_blank" rel="noopener">🧭 Navi</a>` : ''}
+        ${t ? `<button class="btn" data-nav="${o.id}" type="button">🧭 Navi</button>` : ''}
         ${c.phone ? `<a class="btn call" href="tel:${esc(c.phone)}">📞 Anrufen</a>` : `<button class="btn" data-act="cust" data-id="${esc(c.id)}" type="button">📞 Nummer fehlt</button>`}
       </div>
       <div class="arow">
@@ -594,19 +607,18 @@ function autoRoute(delay = 600) {
   });
 }
 
-function scanDialog() {
+function scanDialog(firstFiles) {
   const d = openDialog(`
-    <h3>Zettel scannen</h3>
-    <p class="hint">Ein Zettel nach dem anderen. Jeder kommt automatisch in die Tour, die Route rechnet sich selbst.</p>
-    <div class="bigbtns">
-      <label class="btn primary">📷 Zettel fotografieren<input id="sCam" type="file" accept="image/*" capture="environment" hidden></label>
-      <label class="btn">🖼️ Mehrere aus Fotos wählen<input id="sLib" type="file" accept="image/*" multiple hidden></label>
-    </div>
-    <div id="sList" class="list mt"></div>
+    <h3>Zettel</h3>
+    <div id="sList" class="list"></div>
     <p class="hint" id="sRoute"></p>
-    <div class="foot">
-      <button class="btn" value="cancel" type="submit">Fertig</button>
+    <div class="bigbtns">
+      <label class="btn primary">📷 Nächster Zettel<input id="sCam" type="file" accept="image/*" capture="environment" hidden></label>
       <button class="btn dark" id="sGo" type="button" disabled>🚗 Los</button>
+    </div>
+    <div class="foot">
+      <label class="btn sm">🖼️ Aus Fotos<input id="sLib" type="file" accept="image/*" multiple hidden></label>
+      <button class="btn sm" value="cancel" type="submit">Schliessen</button>
     </div>`);
   const list = $('#sList', d), go = $('#sGo', d), routeInfo = $('#sRoute', d);
   let busy = 0, added = 0;
@@ -650,15 +662,21 @@ function scanDialog() {
   $('#sLib', d).addEventListener('change', e => { handle([...e.target.files]); e.target.value = ''; });
   go.addEventListener('click', () => { closeDialog(); goTour(); });
   refresh();
+  if (firstFiles && firstFiles.length) handle(firstFiles);
 }
+// „📷 Scannen“ öffnet direkt die Kamera; das Foto landet sofort im Zettel-Fenster
+document.addEventListener('change', e => {
+  const inp = e.target.closest('input[data-quickscan]'); if (!inp) return;
+  const files = [...inp.files]; inp.value = '';
+  if (files.length) scanDialog(files);
+});
 
 // „Los“: Zeiten ab jetzt, Navi zum ersten Stopp sofort öffnen
 function goTour() {
   const first = openStops()[0]; if (!first) return;
   if (lastRoute) departNow();
   const t = target(db.customers[first.custId]);
-  if (t) window.open(navUrl(t), '_blank');
-  setTimeout(nextStopDialog, 500);
+  if (t) startNav(first.id);
 }
 
 // ---------- Dialoge ----------
@@ -806,8 +824,8 @@ function deliveredDialog(orderId) {
         <button class="btn sm" id="dKeep" type="button">„Stimmt so“ – Rest ist Trinkgeld</button>
         <button class="btn sm" id="dRound" type="button"></button>
       </div>` : ''}
-    <label class="f">Trinkgeld CHF</label>
-    <div class="tips">${[0, 1, 2, 3, 5].map(v => `<button type="button" data-tip="${v}">${v}</button>`).join('')}</div>
+    <label class="f">Trinkgeld CHF${isCash ? '' : ' – antippen = fertig'}</label>
+    <div class="tips">${[0, 1, 2, 3, 5].map(v => `<button type="button" data-tip="${v}">${v === 0 ? 'Keins' : v}</button>`).join('')}</div>
     <input id="dTip" class="mt" inputmode="decimal" placeholder="anderer Betrag" value="0">
     <label class="toggle"><input type="checkbox" id="dBell" ${c.bell ? '' : 'checked'}> Meine Position jetzt als Klingel/Eingang merken</label>
     ${autoPark ? '<p class="hint">🅿️ Parkplatz wird automatisch gelernt (dort, wo du angekommen bist).</p>'
@@ -818,7 +836,7 @@ function deliveredDialog(orderId) {
     </div>`);
   const tipIn = $('#dTip', d);
   const setTip = v => { tipIn.value = fr(v); $$('[data-tip]', d).forEach(x => x.classList.toggle('on', +x.dataset.tip === +v)); };
-  $$('[data-tip]', d).forEach(b => b.addEventListener('click', () => setTip(b.dataset.tip)));
+  $$('[data-tip]', d).forEach(b => b.addEventListener('click', () => { setTip(b.dataset.tip); if (!isCash) $('#dOk', d).click(); }));
   if (isCash) {
     const giveIn = $('#dGive', d), out = $('#dChange', d), keepRow = $('#dKeepRow', d);
     const update = () => {
@@ -848,7 +866,7 @@ function deliveredDialog(orderId) {
     $('#dOk', d).disabled = true;
     if (wantBell || wantPark) {
       try {
-        const p = await gps();
+        const p = lastPos && Date.now() - (lastPos.t || 0) < 30000 ? lastPos : await gps();
         if (p.acc > 60) toast(`GPS ungenau (±${Math.round(p.acc)} m) – Punkt später prüfen`, 3500);
         const pt = { lat: p.lat, lng: p.lng };
         if (wantBell) c.bell = pt;
@@ -869,7 +887,13 @@ function deliveredDialog(orderId) {
     computeEta(Date.now());
     save(); closeDialog(); renderTour(); if (map) drawMap();
     toast((tip ? `Merci! +${fr(tip)} Trinkgeld 💰` : 'Gespeichert ✓') + learned, 3000);
-    if (db.settings.autoNext !== false) setTimeout(nextStopDialog, 350);
+    if (live.on) {
+      // Im Navi: automatisch weiter zum nächsten Kunden
+      live.target = null; live.at = 0;
+      const nx = openStops()[0];
+      if (nx) { toast(`➡️ Weiter: ${db.customers[nx.custId]?.street || ''}`, 2500); liveTick(lastPos || db.settings.base, true); }
+      else { toast('Tour fertig! 🎉', 2500); setLive(false); }
+    } else if (db.settings.autoNext !== false) setTimeout(nextStopDialog, 350);
   });
 }
 
@@ -879,7 +903,7 @@ function nextStopDialog() {
   if (!o) {
     const b = db.settings.base;
     openDialog(`<h3>Tour fertig! 🎉</h3><p class="sub">Alle Bestellungen geliefert.</p>
-      <div class="foot">${b ? `<a class="btn primary" href="${navUrl(b)}" target="_blank" rel="noopener">🍕 Zurück zu Subito</a>` : ''}
+      <div class="foot">${b ? `<button class="btn primary" type="button" ${navPt(b, 'Subito')}>🍕 Zurück zu Subito</button>` : ''}
       <button class="btn" value="cancel" type="submit">OK</button></div>`);
     return;
   }
@@ -893,7 +917,7 @@ function nextStopDialog() {
     ${o.note ? `<div class="note">🧾 ${esc(o.note)}</div>` : ''}
     ${c.park ? '<p class="hint">🅿️ Navi führt dich direkt zum gemerkten Parkplatz.</p>' : ''}
     <div class="bigbtns">
-      ${t ? `<a class="btn primary" href="${navUrl(t)}" target="_blank" rel="noopener">🧭 Navi starten</a>` : ''}
+      ${t ? `<button class="btn primary" type="button" data-nav="${o.id}">🧭 Navi starten</button>` : ''}
       ${c.phone ? `<a class="btn call" href="tel:${esc(c.phone)}">📞 Anrufen</a>` : ''}
       <button class="btn" value="cancel" type="submit">Später</button>
     </div>`);
@@ -902,7 +926,7 @@ function nextStopDialog() {
 function customerDialog(id) {
   const c = db.customers[id]; if (!c) return;
   const st = custStats(c);
-  const pt = (p, name) => p ? `✓ gemerkt <a href="${navUrl(p)}" target="_blank" rel="noopener">(öffnen)</a>` : `<span class="sub">noch nicht gesetzt</span>`;
+  const pt = (p, name) => p ? `✓ gemerkt <a href="#" ${navPt(p, c.street)}>(hinfahren)</a>` : `<span class="sub">noch nicht gesetzt</span>`;
   const d = openDialog(`
     <h3>${esc(c.street)}</h3>
     <p class="sub">${esc(c.plz)} ${esc(c.ort)} · ${st.n}× beliefert · Ø Trinkgeld ${fr(st.avgTip)}${st.last ? ' · zuletzt ' + dt(st.last) : ''}</p>
@@ -967,6 +991,7 @@ function initMap() {
   // Wer die Karte selbst verschiebt, will gerade nicht verfolgt werden
   map.on('dragstart', () => { if (live.on) { live.follow = false; renderLiveBar(); } });
   map.on('click', e => {
+    $('#mapResults').hidden = true;
     if (!pick) return;
     const c = db.customers[pick.custId]; if (!c) return endPick();
     const p = { lat: e.lngLat.lat, lng: e.lngLat.lng };
@@ -978,7 +1003,7 @@ function initMap() {
     try { const p = lastPos || await gps(); showMe(p); map.flyTo({ center: [p.lng, p.lat], zoom: 17.5, pitch: 60 }); } catch (e) { toast('GPS nicht verfügbar'); }
   });
   $('#btnFit').addEventListener('click', () => { if (live.on) { live.follow = false; renderLiveBar(); } fitTour(); });
-  $('#btnLive').addEventListener('click', () => setLive(!live.on));
+  $('#btnLive').addEventListener('click', () => { if (!live.on) live.target = null; setLive(!live.on, true); });
   $('#mapStyles').addEventListener('click', e => {
     const b2 = e.target.closest('[data-style]'); if (!b2) return;
     db.settings.mapStyle = b2.dataset.style; save(); markStyleBtn();
@@ -986,16 +1011,24 @@ function initMap() {
     map.once('idle', () => { styleExtras(); drawRoute(); }); // Sicherheitsnetz
   });
   // Adresssuche
-  $('#mapSearch').addEventListener('submit', e => { e.preventDefault(); searchAddress($('#mapQ').value); });
-  $('#mapQ').addEventListener('input', e => { if (!e.target.value) { $('#mapResults').hidden = true; if (searchPin) { searchPin.remove(); searchPin = null; } } });
+  $('#mapSearch').addEventListener('submit', e => {
+    e.preventDefault();
+    // Enter = ersten Vorschlag nehmen, sonst gründlich suchen
+    if (searchHits.length && !$('#mapResults').hidden) pickHit(searchHits[0]); else searchAddress($('#mapQ').value);
+  });
+  $('#mapQ').addEventListener('input', e => {
+    if (!e.target.value) { $('#mapResults').hidden = true; if (searchPin) { searchPin.remove(); searchPin = null; } return; }
+    suggest(e.target.value);
+  });
+  $('#mapQ').addEventListener('focus', e => { if (e.target.value) suggest(e.target.value); else suggest(''); });
   $('#mapResults').addEventListener('click', e => {
     const r = e.target.closest('[data-i]'); if (!r) return;
-    showSearchResult(searchHits[+r.dataset.i]);
+    pickHit(searchHits[+r.dataset.i]);
   });
   // Lieferungs-Karten unten
   $('#mapSheet').addEventListener('click', e => {
     const done = e.target.closest('[data-done]'); if (done) { deliveredDialog(done.dataset.done); return; }
-    if (e.target.closest('a')) return; // Navi / Anrufen
+    if (e.target.closest('a, [data-nav]')) return; // Navi / Anrufen
     const card = e.target.closest('[data-fly]'); if (!card) return;
     const o = db.tour.find(x => x.id === card.dataset.fly); const c = o && db.customers[o.custId];
     const p = c && (doorPoint(c) || target(c));
@@ -1059,7 +1092,7 @@ function drawMap() {
   });
   openStops().forEach((o, i) => {
     const c = db.customers[o.custId]; if (!c) return;
-    if (c.park) pin(c.park, 'park', 'P', `🅿️ Parkplatz · ${esc(c.street)}<br><a href="${navUrl(c.park)}" target="_blank" rel="noopener">🧭 Hierhin navigieren</a>`);
+    if (c.park) pin(c.park, 'park', 'P', `🅿️ Parkplatz · ${esc(c.street)}<br><a href="#" ${navPt(c.park, 'Parkplatz ' + c.street)}>🧭 Hierhin navigieren</a>`);
     if (c.bell) pin(c.bell, 'bell', '🔔', `🔔 Klingel/Eingang · ${esc(c.street)}`);
     if (c.lat != null) pin({ lat: c.lat, lng: c.lng }, 'stop' + (lateBy(o) > 0 ? ' late' : '') + (i === 0 ? ' next' : ''), String(i + 1), popup(c, o));
   });
@@ -1072,7 +1105,7 @@ function popup(c, o) {
     ${o ? `<br>CHF ${fr(o.amount)} · ${payLabel(o.pay)}${o.time ? ` · 🕗 ${esc(o.time)}` : ''}${eta ? ` · an ${tm(eta)}` : ''}` : ''}
     ${(c.tags || []).length ? `<br>⚠️ ${c.tags.map(esc).join(', ')}` : ''}
     ${c.notes ? `<br>📝 ${esc(c.notes)}` : ''}
-    <div class="pop-btns">${t ? `<a class="btn sm primary" href="${navUrl(t)}" target="_blank" rel="noopener">🧭 Navi</a>` : ''}${c.phone ? `<a class="btn sm call" href="tel:${esc(c.phone)}">📞</a>` : ''}<a class="btn sm" href="#" data-cust="${esc(c.id)}">Kunde</a></div>`;
+    <div class="pop-btns">${t ? `<button class="btn sm primary" type="button" ${o ? `data-nav="${o.id}"` : navPt(t, c.street)}>🧭 Navi</button>` : ''}${c.phone ? `<a class="btn sm call" href="tel:${esc(c.phone)}">📞</a>` : ''}<a class="btn sm" href="#" data-cust="${esc(c.id)}">Kunde</a></div>`;
 }
 document.addEventListener('click', e => {
   const a = e.target.closest('a[data-cust]'); if (!a) return;
@@ -1095,7 +1128,7 @@ function renderSheet() {
       <div class="stime ${late > 0 ? 'late' : ''}">${o.time ? `🕗 ${esc(o.time)}` : ''}${eta ? `${o.time ? ' · ' : ''}an ${tm(eta)}` : ''}${late > 0 ? ` · ${late}′ zu spät` : ''}${!o.time && !eta ? `CHF ${fr(o.amount)} · ${payLabel(o.pay)}` : ''}</div>
       ${(c.tags || []).length ? `<div class="stags">⚠️ ${c.tags.map(esc).join(' · ')}</div>` : ''}
       <div class="sbtns">
-        ${t ? `<a class="btn sm primary" href="${navUrl(t)}" target="_blank" rel="noopener">🧭</a>` : ''}
+        ${t ? `<button class="btn sm primary" type="button" data-nav="${o.id}">🧭</button>` : ''}
         ${c.phone ? `<a class="btn sm call" href="tel:${esc(c.phone)}">📞</a>` : ''}
         <button class="btn sm" data-done="${o.id}" type="button">✓ Geliefert</button>
       </div>
@@ -1103,59 +1136,209 @@ function renderSheet() {
   }).join('');
 }
 
-// ---- LIVE: Karte folgt dir, Route & Zeiten ab deinem Standort ----
-function setLive(on) {
-  live.on = on; live.follow = true; live.geo = null; live.at = 0;
+// ---- NAVI IN DER APP: LIVE folgt dir, Abbiegehinweise, Sprache, Zeiten ab Standort ----
+// live.target: { orderId } = zu dieser Lieferung · { p, label } = zu einem Punkt · null = Tour der Reihe nach
+function startNav(orderId) { live.target = orderId ? { orderId } : null; showView('karte'); setLive(true, true); }
+function startNavTo(p, label) { live.target = { p, label }; showView('karte'); setLive(true, true); }
+// Klicks auf alle Navi-Knöpfe in der App (statt Google Maps)
+document.addEventListener('click', e => {
+  const n = e.target.closest('[data-nav]');
+  if (n) { e.preventDefault(); closeDialogIfOpen(); startNav(n.dataset.nav); return; }
+  const np = e.target.closest('[data-navpt]');
+  if (np) { e.preventDefault(); closeDialogIfOpen(); const [lat, lng, ...l] = np.dataset.navpt.split(','); startNavTo({ lat: +lat, lng: +lng }, l.join(',')); }
+});
+function closeDialogIfOpen() { const d = $('#dlg'); if (d && d.open) d.close(); }
+const navPt = (p, label) => `data-navpt="${p.lat},${p.lng},${esc(label || '')}"`;
+
+async function setLive(on, keepTarget) {
+  live.on = on; live.follow = true; live.geo = null; live.at = 0; live.lastSaid = '';
+  if (!keepTarget) live.target = on ? live.target : null;
   $('#btnLive').classList.toggle('on', on);
-  if (on) {
-    if (!navigator.geolocation) { toast('GPS nicht verfügbar'); live.on = false; return; }
-    startMapWatch();
-    if (lastPos) liveTick(lastPos, true);
-    toast('LIVE: Karte folgt dir 🛰️');
-  } else { drawRoute(); map.easeTo({ pitch: 50, bearing: 0 }); }
+  if (!on) { live.target = null; drawRoute(); map.easeTo({ pitch: 50, bearing: 0 }); renderLiveBar(); return; }
   renderLiveBar();
+  startMapWatch();
+  let pos = lastPos && Date.now() - (lastPos.t || 0) < 60000 ? lastPos : null;
+  if (!pos) { try { const g = await gps(); pos = { ...g, t: Date.now() }; lastPos = pos; } catch (e) { /* kein GPS */ } }
+  if (!pos && db.settings.base) { pos = { ...db.settings.base, t: Date.now(), fake: true }; toast('GPS aus – Route ab Subito'); }
+  if (pos) { showMe(pos); liveTick(pos, true); }
 }
+
+// Reihenfolge für die Navi: Ziel zuerst, dann die restliche Tour
+function liveStops() {
+  const t = live.target;
+  if (t && t.p) return [{ o: null, p: t.p, label: t.label }];
+  let open = openStops().map(o => ({ o, p: target(db.customers[o.custId]) })).filter(s => s.p);
+  if (t && t.orderId) {
+    const i = open.findIndex(s => s.o.id === t.orderId);
+    if (i > 0) open = [open[i], ...open.slice(0, i), ...open.slice(i + 1)];
+    if (i < 0) live.target = null;
+  }
+  return open;
+}
+
 async function liveTick(pos, force) {
   if (!live.on) return;
-  if (live.follow) {
-    map.easeTo({ center: [pos.lng, pos.lat], zoom: Math.max(map.getZoom(), 16.3), pitch: 62,
+  if (live.follow && map) {
+    map.easeTo({ center: [pos.lng, pos.lat], zoom: Math.max(map.getZoom(), 16.5), pitch: 62,
       bearing: pos.heading != null && pos.speed > 1.5 ? pos.heading : map.getBearing(), duration: 900 });
   }
-  const open = openStops().map(o => ({ o, p: target(db.customers[o.custId]) })).filter(s => s.p);
-  if (!open.length) { live.geo = null; drawRoute(); renderLiveBar(); return; }
-  // Route neu holen: alle 30 s oder wenn du 150 m weiter bist
+  const stops = liveStops();
+  if (!stops.length) { live.geo = null; live.next = null; drawRoute(); renderLiveBar(); return; }
+  // Angekommen? (unter 40 m beim Ziel)
+  const goal = stops[0].o ? (doorPoint(db.customers[stops[0].o.custId]) || stops[0].p) : stops[0].p;
+  live.arrived = hav(pos, goal) * 1000 < 40;
+  // Route neu holen: alle 15 s oder 60 m weiter
   const moved = live.from ? hav(live.from, pos) * 1000 : 1e9;
-  if (!force && Date.now() - live.at < 30000 && moved < 150) return;
+  if (!force && Date.now() - live.at < 15000 && moved < 60) { renderLiveBar(); return; }
   live.at = Date.now(); live.from = pos;
   try {
-    const r = await osrmRoute([pos, ...open.map(s => s.p)]);
-    live.geo = r.geo; live.dist = r.legs.length ? r.dist : 0;
-    // Zeiten ab jetzt: Fahrzeit (gelernt) + Übergabezeit pro Kunde
+    const r = await osrmRoute([pos, ...stops.map(s => s.p)], true);
+    live.geo = r.geo;
     const f = driveFactor(); let t = Date.now();
     if (!lastRoute) setRoute({ geo: r.geo, dur: r.dur, dist: r.dist, legs: [], seq: [], departAt: Date.now(), eta: {} });
     lastRoute.eta = lastRoute.eta || {};
-    open.forEach((s, k) => { t += (r.legs[k] || 0) * f * 1000; lastRoute.eta[s.o.id] = t; t += svcMin(db.customers[s.o.custId]) * 60000; });
-    live.next = { o: open[0].o, sec: (r.legs[0] || 0) * f, m: 0 };
-    // Distanz bis zum nächsten Stopp (erster Abschnitt)
-    live.next.m = r.legDist ? r.legDist[0] : 0;
+    stops.forEach((s, k) => {
+      t += (r.legs[k] || 0) * f * 1000;
+      if (s.o) { lastRoute.eta[s.o.id] = t; t += svcMin(db.customers[s.o.custId]) * 60000; }
+    });
+    live.next = { o: stops[0].o, label: stops[0].label, sec: (r.legs[0] || 0) * f, m: r.legDist ? r.legDist[0] : 0, eta: Date.now() + (r.legs[0] || 0) * f * 1000 };
+    live.turn = nextTurn(r.steps);
+    sayTurn();
     save(); drawRoute(); renderSheet(); renderLiveBar(); if (current === 'tour') renderTour();
-  } catch (e) { /* kein Netz: nächstes Mal */ }
+  } catch (e) { renderLiveBar(); /* kein Netz: nächstes Mal */ }
 }
+
+// Abbiegehinweis aus OSRM-Schritten (Deutsch)
+const MOD = { left: 'links', right: 'rechts', 'slight left': 'leicht links', 'slight right': 'leicht rechts',
+  'sharp left': 'scharf links', 'sharp right': 'scharf rechts', straight: 'geradeaus', uturn: 'wenden' };
+const ARROW = { left: '↰', right: '↱', 'slight left': '↖', 'slight right': '↗', 'sharp left': '↰', 'sharp right': '↱', straight: '↑', uturn: '↶' };
+function nextTurn(steps) {
+  if (!steps || steps.length < 2) return null;
+  const s = steps[1], m = s.maneuver || {}, mod = m.modifier || 'straight', name = s.name || s.ref || '';
+  let txt;
+  switch (m.type) {
+    case 'arrive': txt = 'Ziel erreicht'; break;
+    case 'roundabout': case 'rotary': case 'roundabout turn': txt = `im Kreisel ${m.exit ? m.exit + '. Ausfahrt' : 'raus'}`; break;
+    case 'continue': case 'new name': txt = mod === 'straight' ? 'weiter geradeaus' : `${MOD[mod] || ''} halten`; break;
+    case 'fork': txt = `${MOD[mod] || ''} halten`; break;
+    case 'merge': txt = 'einfädeln'; break;
+    case 'on ramp': txt = 'auf die Auffahrt'; break;
+    case 'off ramp': txt = `${MOD[mod] ? MOD[mod] + ' ' : ''}ausfahren`; break;
+    default: txt = mod === 'uturn' ? 'wenden' : `${MOD[mod] || ''} abbiegen`;
+  }
+  const dist = steps[0].distance || 0;
+  return { txt: txt.trim(), name, dist, arrow: m.type === 'arrive' ? '🏁' : (m.type || '').includes('round') || m.type === 'rotary' ? '⟳' : (ARROW[mod] || '↑') };
+}
+const fmtDist = m => m >= 1000 ? `${(m / 1000).toFixed(1)} km` : `${Math.max(10, Math.round(m / 10) * 10)} m`;
+// Sprachansage (gratis, direkt auf dem Handy)
+function sayTurn() {
+  if (!db.settings.voice || !live.turn || !('speechSynthesis' in window)) return;
+  const tt = live.turn, key = tt.txt + tt.name + (tt.dist < 200 ? 'nah' : 'fern');
+  if (key === live.lastSaid) return;
+  live.lastSaid = key;
+  const u = new SpeechSynthesisUtterance(tt.txt === 'Ziel erreicht' ? 'Ziel erreicht' : `In ${fmtDist(tt.dist).replace('km', 'Kilometern').replace(' m', ' Metern')} ${tt.txt}${tt.name ? ' auf ' + tt.name : ''}`);
+  u.lang = 'de-CH'; speechSynthesis.cancel(); speechSynthesis.speak(u);
+}
+
 function renderLiveBar() {
   const bar = $('#liveBar'); if (!bar) return;
   $('#mapStyles').hidden = live.on;
   if (!live.on) { bar.hidden = true; return; }
   bar.hidden = false;
-  const n = live.next, c = n && db.customers[n.o.custId];
-  if (!n || !c) { bar.innerHTML = `<span class="dot"></span> LIVE · keine offene Lieferung`; return; }
-  const late = lateBy(n.o);
-  bar.innerHTML = `<span class="dot"></span><div class="lb-main"><b>${esc(c.street)}</b><small>${Math.max(1, Math.round(n.sec / 60))} Min${n.m ? ` · ${(n.m / 1000).toFixed(1)} km` : ''} · an ${tm(lastRoute.eta[n.o.id])}${late > 0 ? ` · <span class="late">${late}′ zu spät</span>` : ''}</small></div>
-    ${live.follow ? '' : '<button type="button" id="lbFollow">Folgen</button>'}`;
-  const fb = $('#lbFollow'); if (fb) fb.onclick = () => { live.follow = true; renderLiveBar(); if (lastPos) liveTick(lastPos, false); };
+  const n = live.next, c = n && n.o && db.customers[n.o.custId];
+  if (!n) { bar.innerHTML = `<div class="lb-top"><span class="dot"></span><div class="lb-main"><b>Navi</b><small>${live.geo === null && liveStops().length ? 'Berechne Route…' : 'Keine offene Lieferung'}</small></div><button type="button" class="lb-x" data-lb="end">✕</button></div>`; return; }
+  const late = n.o ? lateBy(n.o) : -999, t = live.turn;
+  const dest = c ? c.street : (n.label || 'Ziel'), destP = c ? target(c) : live.target?.p;
+  bar.innerHTML = `
+    ${t && !live.arrived ? `<div class="lb-turn"><span class="lb-arrow">${t.arrow}</span><div><b>${t.txt === 'Ziel erreicht' ? 'Ziel erreicht' : `In ${fmtDist(t.dist)}`}</b><small>${t.txt === 'Ziel erreicht' ? esc(dest) : esc(t.txt) + (t.name ? ' · ' + esc(t.name) : '')}</small></div></div>` : ''}
+    ${live.arrived ? `<div class="lb-turn arrived"><span class="lb-arrow">🏁</span><div><b>Angekommen</b><small>${esc(dest)}${c && c.tags?.length ? ' · ⚠️ ' + c.tags.map(esc).join(', ') : ''}</small></div></div>` : ''}
+    <div class="lb-top"><span class="dot"></span>
+      <div class="lb-main"><b>${esc(dest)}</b><small>${Math.max(1, Math.round(n.sec / 60))} Min · ${(n.m / 1000).toFixed(1)} km · an ${tm(n.eta)}${late > 0 ? ` · <span class="late">${late}′ zu spät</span>` : ''}</small></div>
+      <button type="button" class="lb-x" data-lb="end" aria-label="Navi beenden">✕</button></div>
+    <div class="lb-btns">
+      ${c ? `<button type="button" class="btn sm primary" data-done="${n.o.id}">✓ Geliefert</button>` : ''}
+      ${c && c.phone ? `<a class="btn sm call" href="tel:${esc(c.phone)}">📞</a>` : ''}
+      <button type="button" class="btn sm" data-lb="voice">${db.settings.voice ? '🔊' : '🔇'}</button>
+      ${live.follow ? '' : '<button type="button" class="btn sm" data-lb="follow">◎ Folgen</button>'}
+      ${destP ? `<a class="btn sm" href="${navUrl(destP)}" target="_blank" rel="noopener" title="Extern öffnen">G</a>` : ''}
+    </div>`;
 }
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-lb]'); if (!b) return;
+  const a = b.dataset.lb;
+  if (a === 'end') setLive(false);
+  if (a === 'voice') { db.settings.voice = !db.settings.voice; save(); renderLiveBar(); if (db.settings.voice) { live.lastSaid = ''; sayTurn(); } }
+  if (a === 'follow') { live.follow = true; renderLiveBar(); if (lastPos) liveTick(lastPos, false); }
+});
+document.addEventListener('click', e => {
+  const d = e.target.closest('#liveBar [data-done]'); if (d) deliveredDialog(d.dataset.done);
+});
 
 // ---- Adresssuche auf der Karte ----
 let searchHits = [];
+// Vorschläge beim Tippen: zuerst eigene Kunden (sofort), dann Photon (gratis, für Tippen-mit-Vorschlägen gemacht)
+let suggestTimer = null, suggestCtl = null;
+function renderHits(loading) {
+  const box = $('#mapResults');
+  if (!searchHits.length && !loading) { box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = searchHits.map((h, i) => `<button class="res" type="button" data-i="${i}">
+      <span class="res-ic">${h.kind === 'cust' ? '⭐' : h.kind === 'street' ? '🛣️' : h.kind === 'poi' ? '📍' : '🏠'}</span>
+      <span><b>${esc(h.title)}</b><small>${esc(h.sub)}</small></span></button>`).join('')
+    + (loading ? '<div class="res"><span class="spin"></span> Suche weitere…</div>' : '');
+}
+function suggest(q) {
+  q = q.trim();
+  clearTimeout(suggestTimer);
+  // 1) Eigene Kunden – sofort, auch offline
+  const nq = norm(q);
+  const custs = Object.values(db.customers)
+    .filter(c => c.lat != null && (!nq || norm(`${c.street} ${c.plz} ${c.ort} ${c.name || ''}`).includes(nq)))
+    .sort((a, b) => (custStats(b).last || 0) - (custStats(a).last || 0)).slice(0, nq ? 4 : 5)
+    .map(c => ({ kind: 'cust', lat: c.lat, lng: c.lng, street: c.street, plz: c.plz, ort: c.ort, title: c.street,
+      sub: `${c.plz} ${c.ort}${c.name ? ' · ' + c.name : ''} · ${custStats(c).n}× beliefert` }));
+  searchHits = custs;
+  if (q.length < 3) { renderHits(false); return; }
+  renderHits(true);
+  // 2) Adressen aus der Umgebung (kurz warten, bis du fertig getippt hast)
+  suggestTimer = setTimeout(async () => {
+    try {
+      if (suggestCtl) suggestCtl.abort();
+      suggestCtl = new AbortController();
+      const b = db.settings.base || { lat: 46.96, lng: 9.56 };
+      const r = await fetch(`https://photon.komoot.io/api/?q=${enc(q)}&limit=8&lang=de&lat=${b.lat}&lon=${b.lng}&bbox=9.2,46.75,9.95,47.15`, { signal: suggestCtl.signal });
+      const j = await r.json();
+      const seen = new Set(custs.map(h => norm(h.street + h.plz)));
+      const more = [];
+      for (const f of j.features || []) {
+        const p = f.properties || {};
+        if (p.countrycode !== 'CH') continue;
+        const isStreet = p.osm_key === 'highway' && !p.housenumber;
+        const street = p.housenumber ? `${p.street || p.name} ${p.housenumber}` : (isStreet ? p.name : (p.street ? `${p.street}${p.housenumber ? ' ' + p.housenumber : ''}` : p.name));
+        const plz = p.postcode || '', ort = PLZ_ORT[plz] || p.city || p.district || '';
+        const key = norm(street + plz); if (!street || seen.has(key)) continue; seen.add(key);
+        const kind = p.housenumber ? 'addr' : isStreet ? 'street' : 'poi';
+        more.push({ kind, lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0], street: kind === 'poi' && p.street ? (p.street + (p.housenumber ? ' ' + p.housenumber : '')) : street,
+          plz, ort, title: kind === 'poi' ? p.name : street, sub: [kind === 'poi' && p.street ? p.street : '', [plz, ort].filter(Boolean).join(' ')].filter(Boolean).join(' · ') });
+      }
+      if ($('#mapQ').value.trim() !== q) return; // schon weitergetippt
+      searchHits = [...custs, ...more].slice(0, 8);
+      renderHits(false);
+    } catch (e) { if (e.name !== 'AbortError') renderHits(false); }
+  }, 250);
+}
+// Vorschlag gewählt: Strasse ohne Nummer → Nummer dazutippen; sonst Punkt zeigen
+function pickHit(h) {
+  if (!h) return;
+  if (h.kind === 'street') {
+    const inp = $('#mapQ'); inp.value = `${h.street} `; inp.focus();
+    map.flyTo({ center: [h.lng, h.lat], zoom: 16.5, pitch: 55 });
+    suggest(inp.value);
+    toast('Hausnummer dazutippen', 1800);
+    return;
+  }
+  showSearchResult(h);
+}
 async function searchAddress(q) {
   q = q.trim(); if (!q) return;
   const box = $('#mapResults'); box.hidden = false; box.innerHTML = '<div class="res"><span class="spin"></span> Suche…</div>';
@@ -1195,7 +1378,7 @@ function showSearchResult(h) {
       <b>${esc(h.street)}</b><br>${esc([h.plz, h.ort].filter(Boolean).join(' '))}
       ${known ? `<br><small>Bekannter Kunde · ${custStats(known).n}× beliefert${known.notes ? ' · 📝 ' + esc(known.notes) : ''}</small>` : ''}
       <div class="pop-btns"><button class="btn sm primary" type="button" id="srAdd">＋ Zur Tour</button>
-      <a class="btn sm" href="${navUrl(h)}" target="_blank" rel="noopener">🧭 Navi</a></div>`))
+      <button class="btn sm" type="button" ${navPt(h, h.street)}>🧭 Navi</button></div>`))
     .addTo(map);
   searchPin.togglePopup();
   map.flyTo({ center: [h.lng, h.lat], zoom: 17.5, pitch: 60 });
@@ -1241,7 +1424,7 @@ function startMapWatch() {
   if (watchId != null || !navigator.geolocation) return;
   watchId = navigator.geolocation.watchPosition(p => {
     onFix(p);
-    lastPos = { lat: p.coords.latitude, lng: p.coords.longitude, heading: p.coords.heading, speed: p.coords.speed, acc: p.coords.accuracy };
+    lastPos = { lat: p.coords.latitude, lng: p.coords.longitude, heading: p.coords.heading, speed: p.coords.speed, acc: p.coords.accuracy, t: Date.now() };
     liveTick(lastPos, false);
   }, () => {}, { enableHighAccuracy: true, maximumAge: 2000 });
 }
@@ -1438,7 +1621,7 @@ function showView(name) {
   if (name === 'einst') renderEinst();
   if (name === 'karte') {
     if (!map) initMap(); else { map.resize(); drawMap(); }
-    if (!pick && openStops().length) setTimeout(fitTour, 400);
+    if (!pick && !live.on && openStops().length) setTimeout(() => { if (!live.on) fitTour(); }, 400);
     startMapWatch();
   } else stopMapWatch();
 }
@@ -1462,6 +1645,14 @@ addEventListener('online', updateNet); addEventListener('offline', updateNet);
 
 // ---------- Start ----------
 updateNet();
+// Texterkennung im Hintergrund vorladen → erster Scan ist sofort bereit
+setTimeout(async () => {
+  if (!navigator.onLine || ocrWorker) return;
+  try {
+    if (!window.Tesseract) await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js');
+    if (!ocrWorker) ocrWorker = Tesseract.createWorker('deu');
+  } catch (e) { /* später beim Scannen */ }
+}, 2500);
 renderTour();
 if (!db.settings.base) {
   // Beim ersten Start Subito automatisch auf der Karte suchen
