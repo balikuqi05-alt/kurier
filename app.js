@@ -146,11 +146,13 @@ async function ocr(file, onStatus) {
   if (!window.Tesseract) { onStatus('Lade Texterkennung (nur beim ersten Mal)…'); await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js'); }
   let img = file;
   try { img = await prepImage(file); } catch (e) { /* Originalbild verwenden */ }
+  if (!ocrWorker) { onStatus('Starte Texterkennung…'); ocrWorker = Tesseract.createWorker('deu'); }
+  const worker = await ocrWorker;
   onStatus('Lese Zettel…');
-  const worker = await Tesseract.createWorker('deu');
-  try { const { data } = await worker.recognize(img); return data.text || ''; }
-  finally { await worker.terminate(); }
+  const { data } = await worker.recognize(img);
+  return data.text || '';
 }
+let ocrWorker = null; // wird einmal gestartet und für alle Zettel benutzt
 // Foto verkleinern, in Graustufen umwandeln und Kontrast strecken (dunkle Fotos im Auto!)
 async function prepImage(file) {
   const bmp = await createImageBitmap(file);
@@ -170,50 +172,100 @@ async function prepImage(file) {
 }
 
 // Liest Bestellzettel (Subito-Zettel, WhatsApp-Text, andere Zettel).
-// Die eigene Subito-Adresse/Telefonnummer im Kopf des Zettels wird ignoriert.
-const SUBITO_LINE = /subito|pizzakurier|center\s*au|kantons?strasse\s*24|7302\s*landquart|322\s?20\s?20|www\.|mwst|che[-\s]?\d{3}/i;
+// Subito-Zettel: Kopf oben rechts = Subito selbst → wird ignoriert.
+// Gelesen wird nur der Block unter „Kunden-Adresse“: Name, Strasse, PLZ Ort, Telefon, Etage.
+const SUBITO_LINE = /subito|pizza\s*k|center\s*au|kantons?.?strasse\s*24|322\s?20\s?20|www\.|mwst|che[-\s]?\d{3}/i;
+// PLZ → Ort im Liefergebiet (zum Korrigieren, wenn die Texterkennung den Ort verunstaltet)
+const PLZ_ORT = {
+  '7302': 'Landquart', '7206': 'Igis', '7205': 'Zizers', '7208': 'Malans', '7203': 'Trimmis', '7204': 'Untervaz',
+  '7304': 'Maienfeld', '7307': 'Jenins', '7306': 'Fläsch', '7310': 'Bad Ragaz', '7303': 'Mastrils', '7214': 'Grüsch',
+  '7212': 'Seewis Dorf', '7220': 'Schiers', '7215': 'Fanas', '7213': 'Valzeina', '7233': 'Jenaz', '7235': 'Fideris',
+  '7240': 'Küblis', '7000': 'Chur', '7320': 'Sargans', '7312': 'Pfäfers', '7317': 'Valens'
+};
+function lev(a, b) {
+  a = norm(a); b = norm(b);
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++)
+    d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return d[a.length][b.length];
+}
+function matchOrt(ort, plz) {
+  if (ort) {
+    let best = null, bd = 99;
+    for (const o of Object.keys(ORTE)) {
+      const dd = norm(ort).startsWith(norm(o)) ? 0 : lev(ort, o);
+      if (dd < bd) { bd = dd; best = o; }
+    }
+    if (best && bd <= Math.max(1, Math.floor(best.length / 4))) return best;
+  }
+  return PLZ_ORT[plz] || ort;
+}
 function parseOrder(text) {
   const all = text.split(/\r?\n|[,;|]/).map(l => l.trim()).filter(Boolean);
-  const lines = all.filter(l => !SUBITO_LINE.test(l));
-  const out = { name: '', street: '', plz: '', ort: '', phone: '', amount: '', pay: '', time: '', etage: '' };
+  const out = { name: '', street: '', plz: '', ort: '', phone: '', amount: '', pay: '', time: '', etage: '', ref: '' };
   const phoneRe = /(?:\+41|0041|0)\s?\(?0?\)?\s?([1-9]\d)[\s./-]?(\d{3})[\s./-]?(\d{2})[\s./-]?(\d{2})\b/;
   const plzRe = /\b(\d{4})\s+([A-ZÄÖÜ][A-Za-zÄÖÜäöüéèàç .\-]{1,30})/;
   const streetRe = /([A-Za-zÄÖÜäöüéèàç.\-' ]{3,40}?)\s+(\d{1,4}\s?[a-zA-Z]?)\b/;
   const streetWord = /(str|weg|gasse|platz|rain|halde|quai|allee|ring|hof|matt|acker|bühl|buehl|feld|via|park|berg|dorf|boden|wiese|egg|rank|zelg|gut|au)\b|strasse/i;
-  const junk = /kunden.?adresse|lieferzeit|kopie|bestellung|kunde:?$/ig;
-  let streetIdx = -1;
-  for (let i = 0; i < lines.length; i++) {
-    const l = lines[i];
-    if (!out.plz) {
-      const m = l.match(plzRe);
-      if (m && +m[1] >= 1000 && !/\d{2}\.\d{2}\.\d{4}/.test(l)) {
-        out.plz = m[1]; out.ort = m[2].trim().replace(/\s+(\d|lieferzeit).*$/i, '');
-        if (!out.street && i > 0) { const p = lines[i - 1].match(streetRe); if (p && !phoneRe.test(lines[i - 1])) { out.street = `${p[1].trim()} ${p[2]}`; streetIdx = i - 1; } }
-        continue;
-      }
-    }
-    if (!out.street) { const m = l.match(streetRe); if (m && streetWord.test(m[1])) { out.street = `${m[1].trim()} ${m[2]}`; streetIdx = i; } }
-    if (!out.phone) { const m = l.match(phoneRe); if (m) { out.phone = '0' + m[1] + m[2] + m[3] + m[4]; continue; } }
+  const isDate = l => /\d{1,2}\.\d{1,2}\.\d{2,4}/.test(l);
+
+  // 1) Kundenblock finden: alles nach „Kunden-Adresse“ (OCR-tolerant), ohne Subito-Zeilen
+  const anchor = all.findIndex(l => /kunden|k.nden.?adr|adress?e/i.test(l));
+  const lines = (anchor >= 0 ? all.slice(anchor + 1) : all).filter(l => !SUBITO_LINE.test(l));
+
+  // 2) Strasse = erste Zeile mit Strassenwort + Hausnummer (keine Telefonnummer, kein Datum)
+  let si = lines.findIndex(l => { const m = l.match(streetRe); return m && streetWord.test(m[1]) && !phoneRe.test(l) && !isDate(l); });
+  // 3) PLZ/Ort = direkt unter der Strasse (max. 2 Zeilen tiefer); sonst erste PLZ-Zeile
+  let pi = -1;
+  if (si >= 0) {
+    for (let k = si + 1; k <= si + 2 && k < lines.length; k++) { const m = lines[k].match(plzRe); if (m && !isDate(lines[k])) { pi = k; break; } }
+  }
+  if (pi < 0) pi = lines.findIndex(l => { const m = l.match(plzRe); return m && +m[1] >= 1000 && !isDate(l) && !phoneRe.test(l); });
+  if (si < 0 && pi > 0) { const m = lines[pi - 1].match(streetRe); if (m && !phoneRe.test(lines[pi - 1])) si = pi - 1; }
+  if (si >= 0) { const m = lines[si].match(streetRe); out.street = `${m[1].trim()} ${m[2]}`.replace(/\s+/g, ' '); }
+  if (pi >= 0) { const m = lines[pi].match(plzRe); out.plz = m[1]; out.ort = m[2].trim().replace(/\s+(\d|lieferzeit).*$/i, ''); }
+
+  // 4) Telefon und Etage: erst im Kundenblock, nach der Strasse
+  const from = Math.max(0, si);
+  for (const l of lines.slice(from)) {
+    if (!out.phone) { const m = l.match(phoneRe); if (m) out.phone = '0' + m[1] + m[2] + m[3] + m[4]; }
     if (!out.etage) { const m = l.match(/etage\s*:?\s*(-?\d+|eg|ug|og)/i); if (m) out.etage = m[1]; }
   }
-  // Name = Zeile vor der Strasse (ohne „Lieferzeit“, „Kunden-Adresse“ usw.)
-  if (streetIdx > 0) {
-    const nm = lines[streetIdx - 1].replace(junk, '').replace(/\d{1,2}[:.]\d{2}/, '').replace(/[:\-–]+$/, '').trim()
-      .split(/\s+/).filter((w, i, a) => !(w.length === 1 && i === a.length - 1)).join(' '); // OCR-Krümel am Ende weg
+
+  // 5) Name = Zeile vor der Strasse, ohne Uhrzeit und OCR-Krümel
+  if (si > 0) {
+    let nm = lines[si - 1].replace(/kunden.?adresse|lieferzeit:?|kopie/ig, '').replace(/\d{1,2}[:.]\d{2}/g, '').trim();
+    const words = nm.split(/\s+/).filter(Boolean);
+    while (words.length > 2 && (words[words.length - 1].length <= 2 || /^[A-ZÄÖÜ]{2,3}$/.test(words[words.length - 1]))) words.pop();
+    nm = words.filter(w => !(w.length === 1)).join(' ');
     if (/^[A-Za-zÄÖÜäöüéèàç.' \-]{3,40}$/.test(nm) && !streetWord.test(nm)) out.name = nm;
   }
-  // Lieferzeit
-  const lt = text.match(/lieferzeit\D{0,25}(\d{1,2})[:.](\d{2})/i) || text.match(/lieferdatum[^\n]*?(\d{1,2}):(\d{2})/i);
-  if (lt && +lt[1] < 24) out.time = `${lt[1].padStart(2, '0')}:${lt[2]}`;
-  // Bezahlt?
-  if (/nichts\s*einkassieren|online\s*bezahlt|bezahlt\s*:?\s*online|bereits\s*bezahlt/i.test(text)) out.pay = 'online';
+
+  // 6) Lieferzeit: „Lieferzeit 20:30“, sonst Uhrzeit auf der Namenszeile / im Kopf, sonst „Lieferdatum … 20:30“
+  let lt = text.match(/lieferzeit\D{0,25}(\d{1,2})[:.](\d{2})/i);
+  if (!lt) {
+    const head = all.slice(0, Math.max(0, anchor) + (si >= 0 ? si + 2 : 6));
+    for (const l of head) { if (isDate(l)) continue; const m = l.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/); if (m) { lt = m; break; } }
+  }
+  if (!lt) lt = text.match(/lieferdatum[^\n]*?(\d{1,2}):(\d{2})/i);
+  if (lt && +lt[1] < 24) out.time = `${String(lt[1]).padStart(2, '0')}:${lt[2]}`;
+
+  // 7) Bezahlt?
+  if (/nichts\s*einkassieren|online\s*bez|bezahlt\s*:?\s*online|bereits\s*bezahlt|twint/i.test(text)) out.pay = 'online';
   else if (/kartenzahlung|mit\s*karte|kreditkarte|debitkarte/i.test(text)) out.pay = 'karte';
   else if (/barzahlung|\bbar\b|zu\s*bezahlen/i.test(text)) out.pay = 'bar';
-  // Betrag = grösster Geldbetrag auf dem Zettel (das ist das Total)
+
+  // 8) Betrag = grösster Geldbetrag (das Total), Referenznummer gegen doppelte Zettel
   const nums = (lines.join('\n').match(/\d{1,4}[.,]\d{2}(?!\.\d)/g) || []).map(n => +n.replace(',', '.')).filter(n => n > 0 && n < 2000);
   if (nums.length) out.amount = fr(Math.max(...nums));
-  // Ort an bekannte Liefer-Orte angleichen
-  if (out.ort) { const hit = Object.keys(ORTE).find(o => norm(o) === norm(out.ort) || norm(out.ort).startsWith(norm(o))); if (hit) out.ort = hit; }
+  const rf = text.match(/\b(?:ref|rat|rof|rel)\.?\s*:?\s*(\d{5,})/i); if (rf) out.ref = rf[1];
+
+  // 9) Ort angleichen + Sicherung: niemals die Subito-Adresse als Kunde
+  out.ort = matchOrt(out.ort, out.plz);
+  if (/^kantons?.?str/i.test(norm(out.street)) && /^24\b/.test(out.street.replace(/^\D+/, '')) || (out.plz === '7302' && /kanton/i.test(out.street))) {
+    out.street = ''; out.plz = ''; out.ort = '';
+  }
   return out;
 }
 
@@ -326,7 +378,7 @@ function computeEta(fromTime) {
   });
 }
 
-async function optimizeTour() {
+async function optimizeTour(quiet) {
   const open = openStops();
   const stops = open.map(o => {
     const c = db.customers[o.custId];
@@ -337,7 +389,7 @@ async function optimizeTour() {
   let start = db.settings.base;
   if (db.settings.startFromGps) { try { start = await gps(); } catch (e) { toast('GPS nicht verfügbar – starte bei Subito'); } }
   if (!start) return toast('Zuerst unter „Mehr“ den Standort von Subito setzen');
-  toast('Berechne beste Reihenfolge…', 8000);
+  if (!quiet) toast('Berechne beste Reihenfolge…', 8000);
   const depart = Date.now();
   let order;
   try {
@@ -425,19 +477,19 @@ function renderTour() {
   const cash = open.filter(o => o.pay === 'bar').reduce((a, o) => a + (+o.amount || 0), 0);
   const v = $('#view-tour');
   v.innerHTML = `
-    <div class="brand"><img src="subito-logo.png" alt="Subito"></div>
     <div class="summary">
       <div class="stat"><b>${open.length}</b><small>offen</small></div>
       <div class="stat"><b>${fr(sum)}</b><small>CHF total</small></div>
       <div class="stat"><b>${fr(cash)}</b><small>CHF bar kassieren</small></div>
     </div>
     ${lastRoute && open.length ? `<p class="hint">Route: ca. ${Math.round(lastRoute.dur * driveFactor() / 60)} Min · ${(lastRoute.dist / 1000).toFixed(1)} km${db.learn?.driveN ? ` · gelernt: du fährst ${Math.round((driveFactor() - 1) * 100) >= 0 ? '+' : ''}${Math.round((driveFactor() - 1) * 100)} % gegenüber Berechnung` : ''}</p>
-      <button class="btn block ok" data-act="depart" type="button">🚗 Losfahren (Zeiten ab jetzt)</button>` : ''}
+` : ''}
     <div class="row">
-      <button class="btn primary" data-act="add" type="button">＋ Bestellung</button>
-      <button class="btn" data-act="opt" type="button" ${open.length < 1 ? 'disabled' : ''}>⚡ Beste Reihenfolge</button>
+      <button class="btn primary big" data-act="scan" type="button">📷 Scannen</button>
+      <button class="btn" data-act="add" type="button">＋ Von Hand</button>
     </div>
-    ${open.length > 1 && db.settings.navApp === 'google' ? '<button class="btn block mt" data-act="allnav" type="button">Ganze Tour in Google Maps</button>' : ''}
+    ${open.length ? `<button class="btn ok block mt big" data-act="go" type="button">🚗 Los – Navi zum 1. Stopp</button>` : ''}
+    ${open.length && !lastRoute ? '<button class="btn block mt" data-act="opt" type="button">⚡ Route berechnen</button>' : ''}
     ${open.length ? `<ol class="stops">${open.map((o, i) => stopCard(o, i + 1)).join('')}</ol>`
       : '<div class="empty">Keine offenen Bestellungen.<br>Tippe auf „＋ Bestellung“ oder fotografiere den Zettel.</div>'}
     ${done.length ? `<h2>Erledigt (${done.length})</h2><ol class="stops">${done.map(o => stopCard(o, '✓')).join('')}</ol>
@@ -492,6 +544,8 @@ $('#view-tour').addEventListener('click', e => {
     add: () => orderDialog(),
     opt: () => optimizeTour(),
     depart: () => departNow(),
+    scan: () => scanDialog(),
+    go: () => goTour(),
     allnav: () => {
       const pts = openStops().map(o => target(db.customers[o.custId])).filter(Boolean);
       if (!pts.length) return;
@@ -506,6 +560,106 @@ $('#view-tour').addEventListener('click', e => {
   })[b.dataset.act]?.();
 });
 
+// ---------- Schnell-Scan: mehrere Zettel → automatisch eine Tour ----------
+// Jeder Zettel wird sofort gelesen und übernommen; danach wird die Route automatisch berechnet.
+function isDuplicate(p) {
+  return db.tour.some(o => !o.done && (
+    (p.ref && o.ref === p.ref) ||
+    (norm(db.customers[o.custId]?.street) === norm(p.street) && (o.time || '') === (p.time || '') && (+o.amount || 0) === (+p.amount || 0))
+  ));
+}
+async function addOrderFromParsed(p) {
+  const ort = p.ort || db.settings.lastOrt;
+  const c = upsertCustomer({ street: p.street, plz: p.plz, ort, phone: p.phone, name: p.name });
+  db.settings.lastOrt = ort;
+  const o = { id: uid(), custId: c.id, amount: p.amount || '0', pay: p.pay || 'bar',
+    note: p.etage && p.etage !== '0' ? `Etage ${p.etage}` : '', time: p.time || '', ref: p.ref || '', done: false, addedAt: Date.now() };
+  db.tour.push(o); save();
+  if (c.lat == null) {
+    const g = await geocode(c.street, c.plz, c.ort);
+    if (g) { c.lat = g.lat; c.lng = g.lng; c.approx = g.approx; save(); }
+  }
+  return { o, c };
+}
+// Route automatisch (kurz warten, falls gleich noch ein Zettel kommt)
+let autoRouteTimer = null;
+function autoRoute(delay = 600) {
+  clearTimeout(autoRouteTimer);
+  return new Promise(res => {
+    autoRouteTimer = setTimeout(async () => {
+      if (openStops().some(o => target(db.customers[o.custId])) && db.settings.base) await optimizeTour(true);
+      res();
+    }, delay);
+  });
+}
+
+function scanDialog() {
+  const d = openDialog(`
+    <h3>Zettel scannen</h3>
+    <p class="hint">Ein Zettel nach dem anderen. Jeder kommt automatisch in die Tour, die Route rechnet sich selbst.</p>
+    <div class="bigbtns">
+      <label class="btn primary">📷 Zettel fotografieren<input id="sCam" type="file" accept="image/*" capture="environment" hidden></label>
+      <label class="btn">🖼️ Mehrere aus Fotos wählen<input id="sLib" type="file" accept="image/*" multiple hidden></label>
+    </div>
+    <div id="sList" class="list mt"></div>
+    <p class="hint" id="sRoute"></p>
+    <div class="foot">
+      <button class="btn" value="cancel" type="submit">Fertig</button>
+      <button class="btn ok" id="sGo" type="button" disabled>🚗 Los</button>
+    </div>`);
+  const list = $('#sList', d), go = $('#sGo', d), routeInfo = $('#sRoute', d);
+  let busy = 0, added = 0;
+  const refresh = () => {
+    const n = openStops().length;
+    go.disabled = busy > 0 || !n;
+    go.textContent = busy ? '⏳ Lese…' : `🚗 Los · ${n}`;
+    if (lastRoute && n && !busy) {
+      const late = openStops().filter(o => lateBy(o) > 0).length;
+      routeInfo.innerHTML = `Route: ca. <b>${Math.round(lastRoute.dur * driveFactor() / 60)} Min</b> · ${(lastRoute.dist / 1000).toFixed(1)} km · ${late ? `<span class="warn">⚠️ ${late}× zu spät</span>` : 'alle pünktlich ✓'}`;
+    }
+  };
+  const handle = async files => {
+    for (const file of files) {
+      busy++; refresh();
+      const row = document.createElement('div'); row.className = 'scanitem'; row.innerHTML = '<span class="spin"></span> Lese Zettel…';
+      list.prepend(row);
+      try {
+        const p = parseOrder(await ocr(file, s => { row.innerHTML = `<span class="spin"></span> ${esc(s)}`; }));
+        if (!p.street) {
+          row.className = 'scanitem bad';
+          row.innerHTML = `⚠️ Adresse nicht erkannt <button class="btn sm" type="button">Von Hand</button>`;
+          $('button', row).onclick = () => orderDialog(p);
+        } else if (isDuplicate(p)) {
+          row.className = 'scanitem dup'; row.innerHTML = `↺ ${esc(p.street)} – schon in der Tour`;
+        } else {
+          row.innerHTML = `<span class="spin"></span> ${esc(p.street)} – suche auf Karte…`;
+          const { o, c } = await addOrderFromParsed(p);
+          added++;
+          row.className = 'scanitem ok';
+          row.innerHTML = `<b>✓ ${esc(c.street)}</b>, ${esc(c.ort)}<br><small>${o.time ? `🕗 ${esc(o.time)} · ` : ''}CHF ${fr(o.amount)} · ${payLabel(o.pay)}${c.lat == null ? ' · <span class="warn">⚠️ Punkt fehlt</span>' : c.approx ? ' · <span class="warn">Punkt ungefähr</span>' : ''}</small>`;
+        }
+      } catch (err) {
+        row.className = 'scanitem bad'; row.textContent = '⚠️ Konnte das Foto nicht lesen (Internet beim ersten Mal nötig)';
+      }
+      busy--; refresh();
+    }
+    if (added) { routeInfo.textContent = 'Berechne beste Route…'; await autoRoute(300); refresh(); }
+  };
+  $('#sCam', d).addEventListener('change', e => { handle([...e.target.files]); e.target.value = ''; });
+  $('#sLib', d).addEventListener('change', e => { handle([...e.target.files]); e.target.value = ''; });
+  go.addEventListener('click', () => { closeDialog(); goTour(); });
+  refresh();
+}
+
+// „Los“: Zeiten ab jetzt, Navi zum ersten Stopp sofort öffnen
+function goTour() {
+  const first = openStops()[0]; if (!first) return;
+  if (lastRoute) departNow();
+  const t = target(db.customers[first.custId]);
+  if (t) window.open(navUrl(t), '_blank');
+  setTimeout(nextStopDialog, 500);
+}
+
 // ---------- Dialoge ----------
 function openDialog(html) {
   const d = $('#dlg');
@@ -515,7 +669,7 @@ function openDialog(html) {
 }
 const closeDialog = () => $('#dlg').close();
 
-function orderDialog() {
+function orderDialog(prefill) {
   const ortOptions = Object.keys(ORTE).map(o => `<option value="${esc(o)}">`).join('');
   const streetOptions = Object.values(db.customers).map(c => `<option value="${esc(c.street)}">${esc(c.ort)}</option>`).join('');
   const d = openDialog(`
@@ -584,6 +738,7 @@ function orderDialog() {
     const min = ORTE[f('oOrt').value]; const a = +f('oAmount').value.replace(',', '.');
     f('oMin').textContent = min && a && a < min ? `⚠️ Mindestbestellwert für ${f('oOrt').value}: ${min}.–` : '';
   };
+  if (prefill) setTimeout(() => fill(prefill), 0);
   f('oStreet').addEventListener('input', showKnown);
   f('oOrt').addEventListener('input', () => { showKnown(); checkMin(); });
   f('oAmount').addEventListener('input', checkMin);
@@ -623,6 +778,7 @@ function orderDialog() {
       else toast('⚠️ Adresse nicht gefunden – Punkt im Kunden auf der Karte setzen', 4000);
     }
     closeDialog(); renderTour(); if (map) drawMap();
+    autoRoute();
   });
 }
 
@@ -781,86 +937,132 @@ function customerDialog(id) {
   });
 }
 
-// ---------- Karte ----------
-let map, layer, routeLayer, meMarker, pick = null, watchId = null;
-const icon = (cls, txt, size) => L.divIcon({ className: '', html: `<div class="pin ${cls}">${txt}</div>`, iconSize: [size, size], iconAnchor: [size / 2, size / 2] });
+// ---------- Karte: 3D mit MapLibre (gratis, ohne Schlüssel) ----------
+// 3D = OpenFreeMap (3D-Häuser, Hausnummern, Läden) · Satellit = swisstopo Luftbild + Namen + 3D-Berge
+// Schweiz = swisstopo Detailkarte
+const MAP_STYLES = {
+  '3D': 'https://tiles.openfreemap.org/styles/liberty',
+  'Satellit': 'https://vectortiles.geo.admin.ch/styles/ch.swisstopo.imagerybasemap.vt/style.json',
+  'Schweiz': 'https://vectortiles.geo.admin.ch/styles/ch.swisstopo.basemap.vt/style.json'
+};
+const NEON = '#39d01a';
+let map = null, meMarker = null, pick = null, watchId = null, pins = [];
+
 function initMap() {
   const b = db.settings.base;
-  map = L.map('map', { zoomControl: false, maxZoom: 20 }).setView(b ? [b.lat, b.lng] : [46.96, 9.56], 13);
-  // Echte Luftbilder der Schweiz (swisstopo, gratis, ohne Schlüssel) + Strassennamen darüber
-  const swiss = 'https://wmts.geo.admin.ch/1.0.0/{layer}/default/current/3857/{z}/{x}/{y}.{ext}';
-  const sat = L.layerGroup([
-    L.tileLayer(swiss, { layer: 'ch.swisstopo.swissimage', ext: 'jpeg', maxZoom: 20, maxNativeZoom: 20, attribution: '© swisstopo' }),
-    L.tileLayer(swiss, { layer: 'ch.swisstopo.swissnames3d', ext: 'png', maxZoom: 20, maxNativeZoom: 18, opacity: 0.9 })
-  ]);
-  const street = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 20, maxNativeZoom: 19, attribution: '© OpenStreetMap' });
-  const lk = L.tileLayer(swiss, { layer: 'ch.swisstopo.pixelkarte-farbe', ext: 'jpeg', maxZoom: 20, maxNativeZoom: 18, attribution: '© swisstopo' });
-  const bases = { 'Satellit': sat, 'Strassenkarte': street, 'Landeskarte': lk };
-  (bases[db.settings.mapStyle] || sat).addTo(map);
-  L.control.layers(bases, null, { position: 'topright' }).addTo(map);
-  map.on('baselayerchange', e => { db.settings.mapStyle = e.name; save(); });
-  routeLayer = L.layerGroup().addTo(map);
-  layer = L.layerGroup().addTo(map);
+  if (!MAP_STYLES[db.settings.mapStyle]) db.settings.mapStyle = '3D';
+  map = new maplibregl.Map({
+    container: 'map', style: MAP_STYLES[db.settings.mapStyle],
+    center: b ? [b.lng, b.lat] : [9.56, 46.96], zoom: 14, pitch: 55, bearing: -20, maxPitch: 80,
+    attributionControl: { compact: true }
+  });
+  map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-left');
+  map.on('style.load', () => { styleExtras(); drawRoute(); });
+  map.on('load', drawRoute);
   map.on('click', e => {
     if (!pick) return;
     const c = db.customers[pick.custId]; if (!c) return endPick();
-    const p = { lat: e.latlng.lat, lng: e.latlng.lng };
+    const p = { lat: e.lngLat.lat, lng: e.lngLat.lng };
     if (pick.kind === 'house') { c.lat = p.lat; c.lng = p.lng; c.approx = false; } else c[pick.kind] = p;
     save(); const id = c.id; endPick(); drawMap(); renderTour(); toast('Punkt gespeichert ✓');
     setTimeout(() => customerDialog(id), 400);
   });
   $('#btnMe').addEventListener('click', async () => {
-    try { const p = await gps(); showMe(p); map.setView([p.lat, p.lng], 17); } catch (e) { toast('GPS nicht verfügbar'); }
+    try { const p = await gps(); showMe(p); map.flyTo({ center: [p.lng, p.lat], zoom: 18, pitch: 60 }); } catch (e) { toast('GPS nicht verfügbar'); }
   });
   $('#btnFit').addEventListener('click', fitTour);
+  $('#mapStyles').addEventListener('click', e => {
+    const b2 = e.target.closest('[data-style]'); if (!b2) return;
+    db.settings.mapStyle = b2.dataset.style; save(); markStyleBtn();
+    map.setStyle(MAP_STYLES[b2.dataset.style], { diff: false });
+    map.once('idle', () => { styleExtras(); drawRoute(); }); // Sicherheitsnetz
+  });
+  markStyleBtn();
   drawMap();
 }
+function markStyleBtn() { $$('#mapStyles [data-style]').forEach(x => x.classList.toggle('on', x.dataset.style === db.settings.mapStyle)); }
+
+// Nach jedem Stilwechsel: 3D-Berge (Satellit), 3D-Häuser sicher an
+function styleExtras() {
+  try {
+    if (db.settings.mapStyle === 'Satellit') {
+      if (!map.getSource('dem')) map.addSource('dem', {
+        type: 'raster-dem', tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+        encoding: 'terrarium', tileSize: 256, maxzoom: 14, attribution: 'Höhen: Mapzen/AWS'
+      });
+      map.setTerrain({ source: 'dem', exaggeration: 1.3 });
+    } else map.setTerrain(null);
+  } catch (e) { /* Gelände optional */ }
+}
+
+// Route als leuchtende Linie
+function drawRoute() {
+  if (!map) return;
+  try { drawRouteNow(); } catch (e) { map.once('idle', () => { try { drawRouteNow(); } catch (e2) { /* später */ } }); }
+}
+function drawRouteNow() {
+  const data = lastRoute && openStops().length ? { type: 'Feature', properties: {}, geometry: lastRoute.geo } : { type: 'FeatureCollection', features: [] };
+  if (map.getSource('route')) { map.getSource('route').setData(data); return; }
+  map.addSource('route', { type: 'geojson', data });
+  map.addLayer({ id: 'route-glow', type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': NEON, 'line-width': 16, 'line-opacity': 0.25, 'line-blur': 6 } });
+  map.addLayer({ id: 'route-casing', type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': '#0d2a06', 'line-width': 8 } });
+  map.addLayer({ id: 'route-line', type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': NEON, 'line-width': 5 } });
+}
+
+function pin(p, cls, txt, html) {
+  const el = document.createElement('div'); el.className = `pin ${cls}`; el.textContent = txt;
+  const m = new maplibregl.Marker({ element: el }).setLngLat([p.lng, p.lat]);
+  if (html) m.setPopup(new maplibregl.Popup({ offset: 18, maxWidth: '270px', closeButton: false }).setHTML(html));
+  m.addTo(map); pins.push(m); return m;
+}
 function showMe(p) {
-  if (!meMarker) meMarker = L.marker([p.lat, p.lng], { icon: icon('me', '', 18), zIndexOffset: 1000 }).addTo(map);
-  else meMarker.setLatLng([p.lat, p.lng]);
+  if (!map) return;
+  if (!meMarker) { const el = document.createElement('div'); el.className = 'pin me'; meMarker = new maplibregl.Marker({ element: el }).setLngLat([p.lng, p.lat]).addTo(map); }
+  else meMarker.setLngLat([p.lng, p.lat]);
 }
 function drawMap() {
   if (!map) return;
-  layer.clearLayers(); routeLayer.clearLayers();
+  pins.forEach(m => m.remove()); pins = [];
   const b = db.settings.base;
-  if (b) L.marker([b.lat, b.lng], { icon: icon('base', '🍕', 32) }).bindPopup(`<b>${SUBITO.name}</b><br>${SUBITO.street}, ${SUBITO.plz} ${SUBITO.ort}`).addTo(layer);
+  if (b) pin(b, 'base', '🍕', `<b>${SUBITO.name}</b><br>${SUBITO.street}, ${SUBITO.plz} ${SUBITO.ort}`);
   const tourIds = new Set();
+  Object.values(db.customers).forEach(c => {
+    if (c.lat == null || openStops().some(o => o.custId === c.id)) return;
+    pin({ lat: c.lat, lng: c.lng }, 'cust', '', popup(c));
+  });
   openStops().forEach((o, i) => {
     const c = db.customers[o.custId]; if (!c) return; tourIds.add(c.id);
-    if (c.lat != null) {
-      L.marker([c.lat, c.lng], { icon: icon('stop', i + 1, 30), zIndexOffset: 500 }).bindPopup(popup(c, o)).addTo(layer);
-    }
-    addExtras(c);
+    if (c.park) pin(c.park, 'park', 'P', `🅿️ Parkplatz · ${esc(c.street)}<br><a href="${navUrl(c.park)}" target="_blank" rel="noopener">🧭 Hierhin navigieren</a>`);
+    if (c.bell) pin(c.bell, 'bell', '🔔', `🔔 Klingel/Eingang · ${esc(c.street)}`);
+    if (c.lat != null) pin({ lat: c.lat, lng: c.lng }, 'stop' + (lateBy(o) > 0 ? ' late' : ''), String(i + 1), popup(c, o));
   });
-  // Alle anderen bekannten Kunden klein anzeigen
-  Object.values(db.customers).forEach(c => {
-    if (tourIds.has(c.id) || c.lat == null) return;
-    L.marker([c.lat, c.lng], { icon: icon('cust', '', 14) }).bindPopup(popup(c)).addTo(layer);
-  });
-  if (lastRoute && openStops().length) L.geoJSON(lastRoute.geo, { style: { color: '#d71920', weight: 5, opacity: .75 } }).addTo(routeLayer);
-}
-function addExtras(c) {
-  if (c.park) L.marker([c.park.lat, c.park.lng], { icon: icon('park', 'P', 26) }).bindPopup(`🅿️ Parkplatz für ${esc(c.street)}<br><a href="${navUrl(c.park)}" target="_blank" rel="noopener">Hierhin navigieren</a>`).addTo(layer);
-  if (c.bell) L.marker([c.bell.lat, c.bell.lng], { icon: icon('bell', '🔔', 26) }).bindPopup(`🔔 Klingel/Eingang ${esc(c.street)}`).addTo(layer);
+  drawRoute();
 }
 function popup(c, o) {
-  const t = target(c);
-  return `<b>${esc(c.street)}</b><br>${esc(c.plz)} ${esc(c.ort)}
-    ${o ? `<br>CHF ${fr(o.amount)} · ${payLabel(o.pay)}` : ''}
+  const t = target(c), eta = o && lastRoute?.eta?.[o.id];
+  return `<b>${esc(c.street)}</b>${c.name ? ` · ${esc(c.name)}` : ''}<br>${esc(c.plz)} ${esc(c.ort)}
+    ${o ? `<br>CHF ${fr(o.amount)} · ${payLabel(o.pay)}${o.time ? ` · 🕗 ${esc(o.time)}` : ''}${eta ? ` · an ${tm(eta)}` : ''}` : ''}
     ${(c.tags || []).length ? `<br>⚠️ ${c.tags.map(esc).join(', ')}` : ''}
     ${c.notes ? `<br>📝 ${esc(c.notes)}` : ''}
-    <br>${t ? `<a href="${navUrl(t)}" target="_blank" rel="noopener">🧭 Navi</a> · ` : ''}${c.phone ? `<a href="tel:${esc(c.phone)}">📞 Anrufen</a> · ` : ''}<a href="#" data-cust="${esc(c.id)}">Kunde öffnen</a>`;
+    <div class="pop-btns">${t ? `<a class="btn sm primary" href="${navUrl(t)}" target="_blank" rel="noopener">🧭 Navi</a>` : ''}${c.phone ? `<a class="btn sm call" href="tel:${esc(c.phone)}">📞</a>` : ''}<a class="btn sm" href="#" data-cust="${esc(c.id)}">Kunde</a></div>`;
 }
 document.addEventListener('click', e => {
   const a = e.target.closest('a[data-cust]'); if (!a) return;
   e.preventDefault(); customerDialog(a.dataset.cust);
 });
 function fitTour() {
+  if (!map) return;
   const pts = [];
-  if (db.settings.base) pts.push([db.settings.base.lat, db.settings.base.lng]);
-  openStops().forEach(o => { const c = db.customers[o.custId]; if (c && c.lat != null) pts.push([c.lat, c.lng]); });
-  if (pts.length > 1) map.fitBounds(pts, { padding: [40, 40] });
-  else if (pts.length) map.setView(pts[0], 15);
+  if (db.settings.base) pts.push([db.settings.base.lng, db.settings.base.lat]);
+  openStops().forEach(o => { const c = db.customers[o.custId]; if (c && c.lat != null) pts.push([c.lng, c.lat]); });
+  if (lastRoute?.geo?.coordinates) lastRoute.geo.coordinates.forEach(x => pts.push(x));
+  if (pts.length > 1) {
+    const bb = pts.reduce((bnd, p) => bnd.extend(p), new maplibregl.LngLatBounds(pts[0], pts[0]));
+    map.fitBounds(bb, { padding: { top: 90, bottom: 60, left: 50, right: 50 }, pitch: 45, maxZoom: 16, duration: 900 });
+  } else if (pts.length) map.flyTo({ center: pts[0], zoom: 16, pitch: 55 });
 }
 function startPick(kind, custId) {
   pick = { kind, custId };
@@ -871,7 +1073,8 @@ function startPick(kind, custId) {
   bar.innerHTML = `<span>${label}</span><button type="button" id="pickX">Abbrechen</button>`;
   $('#pickX').onclick = endPick;
   const p = doorPoint(c) || db.settings.base;
-  if (p) map.setView([p.lat, p.lng], 18);
+  // Zum genauen Tippen: flach und nah
+  if (p) setTimeout(() => map.flyTo({ center: [p.lng, p.lat], zoom: 19, pitch: 0, bearing: 0, duration: 800 }), 100);
 }
 function endPick() { pick = null; $('#pickbar').hidden = true; }
 
@@ -988,7 +1191,6 @@ function renderEinst() {
   const s = db.settings;
   const v = $('#view-einst');
   v.innerHTML = `
-    <div class="brand"><img src="subito-logo.png" alt="Subito"></div>
     <h2>Restaurant (Startpunkt)</h2>
     <p class="hint">${SUBITO.name}, ${SUBITO.street}, ${SUBITO.plz} ${SUBITO.ort} · <a href="tel:${SUBITO.phone}">081 322 20 20</a></p>
     <p class="hint">${s.base ? '✓ Standort gesetzt' : '⚠️ Standort noch nicht gesetzt'}</p>
@@ -1066,8 +1268,8 @@ function showView(name) {
   if (name === 'schicht') renderSchicht();
   if (name === 'einst') renderEinst();
   if (name === 'karte') {
-    if (!map) initMap(); else { map.invalidateSize(); drawMap(); }
-    if (!pick && openStops().length) setTimeout(fitTour, 50);
+    if (!map) initMap(); else { map.resize(); drawMap(); }
+    if (!pick && openStops().length) setTimeout(fitTour, 400);
     if (watchId == null && navigator.geolocation) {
       watchId = navigator.geolocation.watchPosition(p => showMe({ lat: p.coords.latitude, lng: p.coords.longitude }), () => {}, { enableHighAccuracy: true });
     }
