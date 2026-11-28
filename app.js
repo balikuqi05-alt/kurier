@@ -177,7 +177,8 @@ let ocrWorker = null; // wird einmal gestartet und für alle Zettel benutzt
 // Foto verkleinern, in Graustufen umwandeln und Kontrast strecken (dunkle Fotos im Auto!)
 async function prepImage(file) {
   const bmp = await createImageBitmap(file);
-  const s = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
+  const mx = Math.max(bmp.width, bmp.height);
+  const s = mx < 1400 ? 1700 / mx : Math.min(1, 2000 / mx);   // kleine Ausschnitte vergrössern = bessere Erkennung
   const c = document.createElement('canvas'); c.width = Math.round(bmp.width * s); c.height = Math.round(bmp.height * s);
   const g = c.getContext('2d', { willReadFrequently: true }); g.drawImage(bmp, 0, 0, c.width, c.height);
   const im = g.getImageData(0, 0, c.width, c.height), d = im.data;
@@ -281,12 +282,43 @@ function parseOrder(text) {
   // 8) Betrag = grösster Geldbetrag (das Total), Referenznummer gegen doppelte Zettel
   const nums = (lines.join('\n').match(/\d{1,4}[.,]\d{2}(?!\.\d)/g) || []).map(n => +n.replace(',', '.')).filter(n => n > 0 && n < 2000);
   if (nums.length) out.amount = fr(Math.max(...nums));
+  // Total vom Zettel hat Vorrang vor „grösster Zahl“ (die kann auch eine Ref-Nummer sein)
   const rf = text.match(/\b(?:ref|rat|rof|rel)\.?\s*:?\s*(\d{5,})/i); if (rf) out.ref = rf[1];
 
   // 9) Bestellte Produkte (mit Bildern von subitopizzakurier.ch)
   out.items = parseItems(all);
 
+  // 9b) Bemerkung des Kunden („Bemerkung: bitte anrufen“, „Hinweis: Hintereingang“ …)
+  const notes = [];
+  const rawLines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);   // ganze Zeilen (Kommas gehören zur Bemerkung)
+  for (let k = 0; k < rawLines.length; k++) {
+    const m = rawLines[k].match(/^(?:bemerkung|bemerkungen|hinweis|hinweise|kommentar|info|anmerkung|notiz|wunsch)\s*:?\s*(.*)$/i);
+    if (m) { let t = m[1].trim(); if (!t && rawLines[k + 1] && !/^\d+\s/.test(rawLines[k + 1])) t = rawLines[k + 1].trim(); if (t.length > 2) notes.push(t); }
+  }
+  // Codes & Klingelhinweise auch ohne „Bemerkung:“ (z. B. „Code 4711“, „bei Müller klingeln“)
+  const code = text.match(/\b(?:code|türcode|tuercode|pin)\s*:?\s*([0-9A-Z#*]{3,8})\b/i);
+  if (code) notes.push(`Code ${code[1]}`);
+  const klingel = text.match(/(?:klingeln|klingel|läuten)\s+(?:bei|an)\s+([A-ZÄÖÜ][\wäöüé\- ]{2,25})/i);
+  if (klingel) notes.push(`Klingel: ${klingel[1].trim()}`);
+  out.remark = [...new Set(notes)].join(' · ');
+  // Hinweis-Wörter → passende Merkmale vorschlagen
+  const hint = (all.join(' ') + ' ' + out.remark).toLowerCase();
+  out.tags = [];
+  if (/\bhund\b/.test(hint)) out.tags.push('Hund');
+  if (/hinter\s*eingang|hintereingang|hinten/.test(hint)) out.tags.push('Hintereingang');
+  if (/klingel\s*(geht\s*nicht|kaputt|defekt)|bitte\s*anrufen|anrufen\s*statt/.test(hint)) out.tags.push('Klingel kaputt – anrufen');
+  if (/kein\s*lift|ohne\s*lift/.test(hint)) out.tags.push('Kein Lift');
+
+  // 9c) Beträge genauer: „zu bezahlen“ (zu kassieren) und „Total“
+  const money = re => { const m = text.match(re); return m ? +m[1].replace(',', '.') : null; };
+  const total = money(/\btotal\b[^\d\n-]{0,20}(\d{1,4}[.,]\d{2})/i);
+  const toPay = money(/zu\s*bezahlen[^\d\n-]{0,20}(-?\d{1,4}[.,]\d{2})/i);
+  if (total && total > 0) out.total = fr(total);
+  if (toPay != null) out.toPay = fr(Math.max(0, toPay));
+  if (out.pay !== 'online' && toPay === 0 && /bezahlt/i.test(text)) out.pay = 'online';
+
   // 10) Ort angleichen + Sicherung: niemals die Subito-Adresse als Kunde
+  if (out.total) out.amount = out.total;
   out.ort = matchOrt(out.ort, out.plz);
   if (/^kantons?.?str/i.test(norm(out.street)) && /^24\b/.test(out.street.replace(/^\D+/, '')) || (out.plz === '7302' && /kanton/i.test(out.street))) {
     out.street = ''; out.plz = ''; out.ort = '';
@@ -544,11 +576,15 @@ async function addOrderFromParsed(p) {
   const c = upsertCustomer({ street: p.street, plz: p.plz, ort, phone: p.phone, name: p.name });
   db.settings.lastOrt = ort;
   const o = { id: uid(), custId: c.id, amount: p.amount || '0', pay: p.pay || 'bar',
-    note: p.etage && p.etage !== '0' ? `Etage ${p.etage}` : '', time: p.time || '', ref: p.ref || '', items: p.items || [], done: false, addedAt: Date.now() };
+    note: p.remark || '', etage: p.etage && p.etage !== '0' ? p.etage : '', time: p.time || '', ref: p.ref || '', items: p.items || [], done: false, addedAt: Date.now() };
+  // Hinweise vom Zettel als Merkmale beim Kunden übernehmen
+  (p.tags || []).forEach(t => { if (!c.tags.includes(t)) c.tags.push(t); });
   db.tour.push(o); save();
   if (c.lat == null) {
     const g = await geocode(c.street, c.plz, c.ort);
-    if (g) { c.lat = g.lat; c.lng = g.lng; c.approx = g.approx; if (g.street) { c.street = g.street; if (g.plz) c.plz = g.plz; } save(); }
+    if (g) { c.lat = g.lat; c.lng = g.lng; c.approx = g.approx; if (g.street) { c.street = g.street; if (g.plz) c.plz = g.plz; c.verified = true; } save(); }
+    // nicht im amtlichen Verzeichnis gefunden → zum Prüfen markieren
+    if (!g || !g.street) { o.check = true; save(); }
   }
   return { o, c };
 }
@@ -662,7 +698,7 @@ function orderDialog(prefill) {
   f('oPaste').addEventListener('click', async () => {
     let text = '';
     try { text = await navigator.clipboard.readText(); } catch (e) { /* Zugriff verweigert */ }
-    if (!text) text = prompt('Bestelltext hier einfügen (z. B. aus WhatsApp):') || '';
+    if (!text) text = await askText('Bestellung einfügen', 'Text aus WhatsApp oder E-Mail hier einfügen');
     if (!text) return;
     f('oRaw').textContent = text; f('oRawBox').hidden = false;
     fill(parseOrder(text)); status('✓ Text übernommen – bitte kontrollieren');
@@ -862,12 +898,12 @@ $('#view-schicht').addEventListener('change', e => {
   s.float = +e.target.value.replace(',', '.') || 0; save(); renderSchicht();
   const d = $('#view-schicht details'); if (d) d.open = true;
 });
-$('#view-schicht').addEventListener('click', e => {
+$('#view-schicht').addEventListener('click', async e => {
   const b = e.target.closest('[data-act]'); if (!b) return;
   if (b.dataset.act === 'end') {
     const s = db.shifts.find(x => x.id === db.activeShift); if (!s) return;
     const t = totals(s.deliveries);
-    if (!confirm(`Schicht beenden?\n${t.n} Lieferungen · Trinkgeld CHF ${fr(t.tip)}\nBar an Subito abgeben: CHF ${fr(t.cash)}`)) return;
+    if (!await ask('Schicht beenden?', `${t.n} Lieferungen · Trinkgeld CHF ${fr(t.tip)}\nBar an Subito abgeben: CHF ${fr(t.cash)}`, 'Beenden')) return;
     s.end = Date.now(); db.activeShift = null; db.tour = openStops(); save(); renderSchicht(); renderTour();
   }
   if (b.dataset.act === 'csv') {
@@ -936,7 +972,7 @@ function renderEinst() {
     try {
       const d = JSON.parse(await f.text());
       if (!d.customers || !d.shifts) throw new Error();
-      if (!confirm('Backup laden? Die aktuellen Daten werden ersetzt.')) return;
+      if (!await ask('Backup laden?', 'Die aktuellen Daten werden ersetzt.', 'Laden', true)) return;
       db = { ...structuredClone(EMPTY), ...d, settings: { ...EMPTY.settings, ...(d.settings || {}) } }; lastRoute = db.route || null; save(); refreshAll(); toast('Backup geladen ✓');
     } catch (err) { toast('Das ist keine gültige Backup-Datei'); }
   };
@@ -955,7 +991,7 @@ $('#view-einst').addEventListener('click', async e => {
     catch (err) { toast('GPS nicht verfügbar'); }
   }
   if (a === 'backup') download(`subito-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(db), 'application/json');
-  if (a === 'wipe' && confirm('Wirklich ALLE Kunden, Notizen und Schichten löschen? Das kann man nicht rückgängig machen.')) {
+  if (a === 'wipe' && await ask('Alles löschen?', 'Alle Kunden, Notizen und Schichten werden gelöscht. Das kann man nicht rückgängig machen.', 'Alles löschen', true)) {
     const keep = { pinHash: db.settings.pinHash };
     localStorage.removeItem(KEY); db = structuredClone(EMPTY); Object.assign(db.settings, keep); lastRoute = null; save(); refreshAll(); renderEinst(); toast('Alles gelöscht');
   }
@@ -1062,10 +1098,39 @@ function itemsHtml(items, big) {
 }
 const itemsLine = items => (items || []).map(it => `${it.q}× ${it.n}`).join(' · ');
 
-// Kurze, dezente Meldung oben
-function toast(msg, ms = 2200) {
-  const t = $('#toast'); t.innerHTML = `${ic('check-circle', true)}<span>${esc(msg)}</span>`; t.classList.add('show');
+// Meldung als weisses Popup (Subito-Stil); Warnungen mit gelbem Icon
+function toast(msg, ms = 2400) {
+  const warn = /nicht|fehlt|kein|⚠|fehler|unklar|prüfen|offline|blockiert/i.test(msg);
+  const t = $('#toast');
+  t.className = 'toast' + (warn ? ' warn' : '');
+  t.innerHTML = `<span class="t-ic">${ic(warn ? 'warning-circle' : 'check-circle', true)}</span><span>${esc(String(msg).replace(/^[✓✔️⚠️➡️🎉📍💰\s]+/u, ''))}</span>`;
+  void t.offsetWidth; t.classList.add('show');
   clearTimeout(toast._h); toast._h = setTimeout(() => t.classList.remove('show'), ms);
+}
+// Frage-Popup: await ask('Titel', 'Text', 'OK-Text', true=rot) → true/false
+function ask(title, text, okLabel = 'OK', danger = false) {
+  return new Promise(res => {
+    const el = $('#pop');
+    el.innerHTML = `<div class="pop-card" role="dialog" aria-modal="true">
+      <span class="pop-ic ${danger ? 'danger' : ''}">${ic(danger ? 'warning' : 'question', true)}</span>
+      <b>${esc(title)}</b>${text ? `<p>${esc(text).replace(/\n/g, '<br>')}</p>` : ''}
+      <div class="pop-btns2"><button type="button" class="btn" data-a="0">Abbrechen</button><button type="button" class="btn ${danger ? 'danger-fill' : 'primary'}" data-a="1">${esc(okLabel)}</button></div></div>`;
+    el.hidden = false; requestAnimationFrame(() => el.classList.add('show'));
+    const done = v => { el.classList.remove('show'); setTimeout(() => { el.hidden = true; el.innerHTML = ''; }, 180); res(v); };
+    el.onclick = e => { const b = e.target.closest('[data-a]'); if (b) done(b.dataset.a === '1'); else if (e.target === el) done(false); };
+  });
+}
+// Text-Popup (z. B. Bestellung aus WhatsApp einfügen)
+function askText(title, placeholder) {
+  return new Promise(res => {
+    const el = $('#pop');
+    el.innerHTML = `<div class="pop-card" role="dialog" aria-modal="true"><span class="pop-ic">${ic('clipboard-text', true)}</span><b>${esc(title)}</b>
+      <textarea id="popT" placeholder="${esc(placeholder || '')}"></textarea>
+      <div class="pop-btns2"><button type="button" class="btn" data-a="0">Abbrechen</button><button type="button" class="btn primary" data-a="1">Übernehmen</button></div></div>`;
+    el.hidden = false; requestAnimationFrame(() => el.classList.add('show')); setTimeout(() => $('#popT')?.focus(), 200);
+    const done = v => { el.classList.remove('show'); setTimeout(() => { el.hidden = true; el.innerHTML = ''; }, 180); res(v); };
+    el.onclick = e => { const b = e.target.closest('[data-a]'); if (b) done(b.dataset.a === '1' ? $('#popT').value : ''); };
+  });
 }
 
 // ---------- Kundenfenster (neu) ----------
@@ -1120,8 +1185,8 @@ function customerDialog(id) {
   }));
   $$('[data-clear]', d).forEach(b => b.addEventListener('click', () => { c[b.dataset.clear] = null; keep(); save(); customerDialog(c.id); }));
   $('#cSave', d).addEventListener('click', () => { keep(); save(); closeDialog(); refreshAll(); toast('Gespeichert'); });
-  $('#cDel', d).addEventListener('click', () => {
-    if (!confirm('Kunde mit allen Notizen löschen?')) return;
+  $('#cDel', d).addEventListener('click', async () => {
+    if (!await ask('Kunde löschen?', 'Alle Notizen und Orte dieses Kunden werden gelöscht.', 'Löschen', true)) return;
     delete db.customers[c.id]; db.tour = db.tour.filter(o => o.custId !== c.id); save(); closeDialog(); refreshAll();
   });
 }
@@ -1459,8 +1524,10 @@ function cardHtml() {
     <div class="cs-info">
       <span class="pill ${cash ? 'cash' : ''}">${cash ? `${ic('money', true)} ${fr(o.amount)} kassieren` : `${ic(o.pay === 'karte' ? 'credit-card' : 'check-circle', true)} ${o.pay === 'online' ? 'Bezahlt' : payLabel(o.pay)} · ${fr(o.amount)}`}</span>
       ${(c.tags || []).map(t => `<span class="pill warn" title="${esc(t)}">${ic(TAG_ICON[t] || 'warning')}${arrived ? ' ' + esc(t.replace(' – anrufen', '')) : ''}</span>`).join('')}
-      ${arrived && o.note ? `<span class="pill">${ic('note-pencil')} ${esc(o.note)}</span>` : ''}
+      ${o.etage ? `<span class="pill">${ic('buildings', true)} ${/^\d+$/.test(o.etage) ? esc(o.etage) + '. Stock' : esc(o.etage)}</span>` : ''}
+      ${o.check ? `<button type="button" class="pill check" data-cust="${esc(c.id)}">${ic('seal-warning', true)} Adresse prüfen</button>` : ''}
     </div>
+    ${o.note ? `<div class="cs-remark">${ic('chat-circle-text', true)}<span>${esc(o.note)}</span></div>` : ''}
     ${arrived && c.notes ? `<div class="cs-note">${ic('note-pencil')} ${esc(c.notes)}</div>` : ''}
     <div class="cs-btns">
       ${c.phone ? `<a class="btn call" href="tel:${esc(c.phone)}" aria-label="Anrufen">${ic('phone', true)}${late > 0 ? ' Bescheid' : ''}</a>` : ''}
@@ -1601,8 +1668,15 @@ function closeCamera() {
 }
 function shoot() {
   const v = $('#camVideo'); if (!v.videoWidth) return;
-  const c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
-  c.getContext('2d').drawImage(v, 0, 0);
+  // Nur den Ausschnitt im grünen Rahmen nehmen (Video ist „cover“ skaliert → Rahmen auf Videopixel umrechnen)
+  const box = v.getBoundingClientRect(), fr8 = $('.cam-frame').getBoundingClientRect();
+  const sc = Math.max(box.width / v.videoWidth, box.height / v.videoHeight);
+  const offX = (v.videoWidth * sc - box.width) / 2, offY = (v.videoHeight * sc - box.height) / 2;
+  let sx = (fr8.left - box.left + offX) / sc, sy = (fr8.top - box.top + offY) / sc, sw = fr8.width / sc, sh = fr8.height / sc;
+  const pad = 0.04; sx -= sw * pad; sy -= sh * pad; sw *= 1 + 2 * pad; sh *= 1 + 2 * pad;   // etwas Rand dazu
+  sx = Math.max(0, sx); sy = Math.max(0, sy); sw = Math.min(v.videoWidth - sx, sw); sh = Math.min(v.videoHeight - sy, sh);
+  const c = document.createElement('canvas'); c.width = Math.round(sw); c.height = Math.round(sh);
+  c.getContext('2d').drawImage(v, sx, sy, sw, sh, 0, 0, c.width, c.height);
   const f = $('#camFlash'); f.classList.remove('go'); void f.offsetWidth; f.classList.add('go');
   navigator.vibrate?.(25);
   enqueue(c);
@@ -1688,7 +1762,7 @@ function renderList() {
     ${done.length ? `<h2>Erledigt (${done.length})</h2><ol class="rows done">${done.map(o => { const c = db.customers[o.custId] || {}; return `<li class="rw"><span class="rw-n">✓</span><div class="rw-b"><b>${esc(c.street)}</b><small>${esc(c.ort)} · CHF ${fr(o.amount)} · Trinkgeld ${fr(o.tip)}</small></div></li>`; }).join('')}</ol>
       <button class="btn block" type="button" data-act="cleardone">Erledigte entfernen</button>` : ''}`;
 }
-$('#view-liste').addEventListener('click', e => {
+$('#view-liste').addEventListener('click', async e => {
   const mn = e.target.closest('[data-menu]');
   if (mn) {
     const o = db.tour.find(x => x.id === mn.dataset.menu), c = o && db.customers[o.custId]; if (!o) return;
@@ -1704,7 +1778,7 @@ $('#view-liste').addEventListener('click', e => {
     return;
   }
   const cu = e.target.closest('[data-cust]'); if (cu) { customerDialog(cu.dataset.cust); return; }
-  const del = e.target.closest('[data-del]'); if (del) { if (confirm('Lieferung entfernen?')) { db.tour = db.tour.filter(o => o.id !== del.dataset.del); setRoute(null); save(); autoRoute(100); renderAll(); } return; }
+  const del = e.target.closest('[data-del]'); if (del) { if (await ask('Lieferung entfernen?', '', 'Entfernen', true)) { db.tour = db.tour.filter(o => o.id !== del.dataset.del); setRoute(null); save(); autoRoute(100); renderAll(); } return; }
   if (e.target.closest('a')) return;
   const b = e.target.closest('[data-act]');
   if (b) { ({ cam: openCamera, add: () => orderDialog(), opt: () => optimizeTour(), cleardone: () => { db.tour = openStops(); save(); renderAll(); } })[b.dataset.act]?.(); return; }
