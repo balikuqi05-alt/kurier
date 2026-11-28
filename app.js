@@ -108,6 +108,14 @@ async function nominatim(params) {
 // Sucht die Adresse in mehreren Varianten (Schreibfehler wie Kantonstrasse/Kantonsstrasse).
 // Ergebnis {lat,lng,approx}: approx = nur Strasse oder nur Ort gefunden → Punkt prüfen.
 async function geocode(street, plz, ort) {
+  // 0) Amtliches Gebäudeadressverzeichnis (swisstopo): exakt, mit offizieller Schreibweise
+  try {
+    const hn = ((street || '').match(/(\d+\s?[a-z]?)\s*$/i) || ['', ''])[1].replace(/\s/g, '').toLowerCase();
+    const hits = await swissSearch([street, plz, ort].filter(Boolean).join(' '), 6);
+    const ok = hits.find(h => (!plz || h.plz === plz) && hn && (h.street.match(/(\d+\s?[a-z]?)\s*$/i) || ['', ''])[1].replace(/\s/g, '').toLowerCase() === hn
+      && lev(norm(h.street.replace(/\s*\d+\s?[a-z]?$/i, '')), norm((street || '').replace(/\s*\d+\s?[a-z]?$/i, ''))) <= 3);
+    if (ok) return { lat: ok.lat, lng: ok.lng, approx: false, street: ok.street, plz: ok.plz, ort: ok.ort };
+  } catch (e) { /* weiter */ }
   // Schnell zuerst: Photon (keine Wartezeit). Nur übernehmen, wenn die Hausnummer genau stimmt.
   try {
     const b = db.settings.base || { lat: 46.96, lng: 9.56 };
@@ -291,7 +299,7 @@ function cleanStreet(st) {
   let w = st.replace(/\s+/g, ' ').trim().split(' ');
   while (w.length > 2 && w[0].length <= 2 && !/\.$/.test(w[0])) w.shift();
   st = w.join(' ');
-  return st.replace(/strass\b/i, 'strasse').replace(/strase\b/i, 'strasse').replace(/str\b(?!\.)/i, 'str.');
+  return st.replace(/strase\b/i, 'strasse');
 }
 
 // ---------- Produkte auf dem Zettel erkennen ----------
@@ -540,7 +548,7 @@ async function addOrderFromParsed(p) {
   db.tour.push(o); save();
   if (c.lat == null) {
     const g = await geocode(c.street, c.plz, c.ort);
-    if (g) { c.lat = g.lat; c.lng = g.lng; c.approx = g.approx; save(); }
+    if (g) { c.lat = g.lat; c.lng = g.lng; c.approx = g.approx; if (g.street) { c.street = g.street; if (g.plz) c.plz = g.plz; } save(); }
   }
   return { o, c };
 }
@@ -1218,7 +1226,7 @@ function onGps(p) {
   const first = !lastPos;
   lastPos = pos; gpsState.status = 'ok'; renderGpsPill();
   showMe(pos);
-  if (follow && smap) smap.go({ center: [pos.lat, pos.lng] });
+  if (follow && smap) smap.easeTo({ center: [pos.lng, pos.lat], zoom: Math.max(smap.getZoom(), 17), pitch: 60, bearing: pos.heading != null && pos.speed > 1.5 ? pos.heading : smap.getBearing(), duration: 900 });
   if (pos.acc <= 80) detectArrival(pos);
   updateRoute(first);
   renderCard();
@@ -1251,7 +1259,7 @@ function renderGpsPill() {
 }
 $('#gpsPill').addEventListener('click', () => {
   const s = gpsState.status;
-  if (s === 'ok') { follow = !follow; renderGpsPill(); if (follow && smap && lastPos) smap.go({ center: [lastPos.lat, lastPos.lng], zoomlevel: 18 }); if (!follow) updateRoute(true); toast(follow ? '◎ Karte folgt dir' : 'Folgen aus'); return; }
+  if (s === 'ok') { follow = !follow; renderGpsPill(); if (follow && smap && lastPos) smap.easeTo({ center: [lastPos.lng, lastPos.lat], zoom: 17.5, pitch: 60, duration: 800 }); if (!follow) fitRoute(); toast(follow ? '◎ Karte folgt dir' : 'Folgen aus'); return; }
   openDialog(`
     <h3>Standort (GPS)</h3>
     <p>${s === 'denied' ? 'Dein Handy blockiert den Standort für diese App.' : 'Die App sucht deinen Standort.'}</p>
@@ -1263,56 +1271,59 @@ $('#gpsPill').addEventListener('click', () => {
 });
 
 // =====================================================================
-//  KARTE – search.ch, Route automatisch vom Standort zur nächsten Lieferung
+//  KARTE – swisstopo (aktuelles Luftbild, 3D), Route automatisch vom Standort zur nächsten Lieferung
 // =====================================================================
+const SWISS_STYLE = 'https://vectortiles.geo.admin.ch/styles/ch.swisstopo.imagerybasemap.vt/style.json';
+let markers = [];
 function initMap() {
-  if (smap || typeof SearchChMap === 'undefined') return;
-  const b = db.settings.base;
-  smap = map = new SearchChMap({
-    container: 'map', center: lastPos ? [lastPos.lat, lastPos.lng] : b ? [b.lat, b.lng] : 'Landquart',
-    zoomlevel: 16, type: 'aerial', controls: '', marker: false, gestureHandling: 'greedy'
+  if (smap || typeof maplibregl === 'undefined') return;
+  const b = db.settings.base, c0 = lastPos || b || { lat: 46.9672, lng: 9.5631 };
+  smap = map = new maplibregl.Map({
+    container: 'map', style: SWISS_STYLE, center: [c0.lng, c0.lat], zoom: 15.5, pitch: 50, bearing: 0, maxPitch: 75,
+    attributionControl: { compact: true }, dragRotate: true, pitchWithRotate: true
   });
-  smap.addEventListener('dragstart', () => { if (follow) { follow = false; renderGpsPill(); } });
-  smap.addEventListener('change', () => readRouteInfo());
-  smap.addEventListener('mouseclick', onMapClick);
-  // Nur echtes Luftbild
-  const aerial = () => { try { if (smap.get('type') !== 'aerial') smap.set({ type: 'aerial' }); } catch (e) { /* egal */ } };
-  aerial(); setTimeout(aerial, 800); smap.addEventListener('load', aerial);
+  smap.on('style.load', () => {
+    try {
+      if (!smap.getSource('dem')) smap.addSource('dem', { type: 'raster-dem', tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'], encoding: 'terrarium', tileSize: 256, maxzoom: 14 });
+      smap.setTerrain({ source: 'dem', exaggeration: 1.15 });
+    } catch (e) { /* Gelände optional */ }
+    drawRouteLine();
+  });
+  smap.on('dragstart', () => { if (follow) { follow = false; renderGpsPill(); } });
+  smap.on('click', onMapClick);
   renderMapPois();
   if (lastPos) showMe(lastPos);
   updateRoute(true);
 }
-function resetMap() {
-  if (!smap) return;
-  smap = map = null; mePoi = null; basePoi = null; stopPois = []; searchPin = null;
-  const el = $('#map'); const fresh = el.cloneNode(false); el.replaceWith(fresh);
-  route.to = null;
-  initMap();
-}
+// Mein Standort: blauer Punkt mit Blickrichtung
 function showMe(p) {
   if (!smap) return;
-  if (!mePoi) { mePoi = new SearchChPOI({ center: [p.lat, p.lng], title: 'Ich', icon: ME_ICON, width: 44, height: 44 }); smap.addPOI(mePoi); }
-  else mePoi.set({ center: [p.lat, p.lng] });
+  if (!mePoi) {
+    const el = document.createElement('div'); el.className = 'me-dot'; el.innerHTML = '<span class="me-cone"></span><span class="me-core"></span>';
+    mePoi = new maplibregl.Marker({ element: el, rotationAlignment: 'map', pitchAlignment: 'map' }).setLngLat([p.lng, p.lat]).addTo(smap);
+  } else mePoi.setLngLat([p.lng, p.lat]);
+  const el = mePoi.getElement();
+  if (p.heading != null && !isNaN(p.heading) && p.speed > 1) { el.classList.add('dir'); el.style.setProperty('--hd', p.heading + 'deg'); }
 }
-// search.ch-Punkt wirklich entfernen (removePOI allein lässt ihn sichtbar)
-function killPoi(x) { if (!x) return; try { x.hide(); } catch (e) { /* egal */ } try { x.destroy(); } catch (e) { /* egal */ } try { smap.removePOI(x); } catch (e) { /* egal */ } }
+function killPoi(x) { try { x && x.remove(); } catch (e) { /* weg */ } }
+function mk(p, cls, inner, html) {
+  const el = document.createElement('div'); el.className = 'pin ' + cls; el.innerHTML = inner;
+  const m = new maplibregl.Marker({ element: el }).setLngLat([p.lng, p.lat]);
+  if (html) m.setPopup(new maplibregl.Popup({ offset: 20, closeButton: false, maxWidth: '260px' }).setHTML(html));
+  return m.addTo(smap);
+}
 function renderMapPois() {
   if (!smap) return;
-  stopPois.forEach(killPoi); stopPois = [];
+  markers.forEach(killPoi); markers = [];
   const b = db.settings.base;
-  if (basePoi && (!b || basePoi._lat !== b.lat || basePoi._lng !== b.lng)) { killPoi(basePoi); basePoi = null; }
-  if (b && !basePoi) { basePoi = new SearchChPOI({ center: [b.lat, b.lng], title: 'Subito', html: `<b>${SUBITO.name}</b><br>${SUBITO.street}, ${SUBITO.plz} ${SUBITO.ort}`, icon: BASE_ICON, width: 38, height: 38 }); basePoi._lat = b.lat; basePoi._lng = b.lng; smap.addPOI(basePoi); }
+  if (b) markers.push(mk(b, 'base', ic('pizza', true), `<b>${SUBITO.name}</b><br>${SUBITO.street}, ${SUBITO.plz} ${SUBITO.ort}`));
   const tg = currentTarget();
   openStops().forEach((o, i) => {
-    const c = db.customers[o.custId]; if (!c) return;
+    const c = db.customers[o.custId]; if (!c || c.lat == null) return;
     const isT = tg && tg.o && tg.o.id === o.id, late = lateBy(o) > 0;
-    const center = c.lat != null ? [c.lat, c.lng] : `${c.plz} ${c.ort}, ${c.street}`;
-    const poi = new SearchChPOI({
-      center, title: `${i + 1}`, icon: pinIcon(i + 1, late ? '#E30613' : isT ? '#8DDD58' : '#ffffff', late ? '#fff' : '#14210F'), width: 36, height: 36,
-      html: `<b>${esc(c.street)}</b><br>${esc(c.plz)} ${esc(c.ort)}${o.time ? ` · 🕗 ${esc(o.time)}` : ''}<br><button class="btn sm primary" type="button" data-nav="${o.id}">Hinfahren</button>`
-    });
-    smap.addPOI(poi); stopPois.push(poi);
-    if (c.park) { const pp = new SearchChPOI({ center: [c.park.lat, c.park.lng], title: 'P', icon: pinIcon('P', '#1565c0', '#fff', '#fff'), width: 28, height: 28, html: `🅿️ Parkplatz ${esc(c.street)}` }); smap.addPOI(pp); stopPois.push(pp); }
+    markers.push(mk({ lat: c.lat, lng: c.lng }, 'stop' + (isT ? ' now' : '') + (late ? ' late' : ''), String(i + 1),
+      `<b>${esc(c.street)}</b><br>${esc(c.plz)} ${esc(c.ort)}${o.time ? ` · bis ${esc(o.time)}` : ''}${itemsLine(o.items) ? `<br><small>${esc(itemsLine(o.items))}</small>` : ''}<div class="pop-btns"><button class="btn sm primary" type="button" data-nav="${o.id}">Hinfahren</button></div>`));
+    if (c.park) markers.push(mk(c.park, 'park', 'P', `Parkplatz · ${esc(c.street)}`));
   });
 }
 // Wohin geht's gerade?
@@ -1326,84 +1337,84 @@ function currentTarget() {
   if (doneStops().length && db.settings.base) return { kind: 'home', p: db.settings.base, label: 'Subito' };
   return null;
 }
-function routeTarget(tg) {
-  if (tg.kind === 'order') { const c = tg.c; if (c.park) return `${c.park.lat},${c.park.lng}`; return `${c.plz} ${c.ort}, ${c.street}`; }
-  return `${tg.p.lat},${tg.p.lng}`;
-}
+// Route vom Standort zum Ziel (OSRM, gratis) – als leuchtende Linie in der App
 function updateRoute(force) {
   if (!smap) return;
   const tg = currentTarget();
-  if (!tg) {
-    // search.ch kann eine Route nicht löschen → Karte ohne Route neu aufbauen
-    if (route.to) resetMap();
-    route.to = null; route.min = null; route.km = null; route.txt = ''; return;
-  }
+  if (!tg || !tg.p) { route.to = null; route.min = null; route.km = null; route.txt = ''; route.geo = null; drawRouteLine(); renderCard(); return; }
   const fromP = lastPos || db.settings.base; if (!fromP) return;
-  const to = routeTarget(tg);
+  const to = `${tg.p.lat.toFixed(5)},${tg.p.lng.toFixed(5)}`;
   const moved = route.from ? hav(route.from, fromP) * 1000 : 1e9;
-  if (!force && route.to === to && moved < 250 && Date.now() - route.at < 90000) return;
-  // Alte Routeninfo nur ignorieren, wenn sich das Ziel geändert hat
-  try { const old = smap.get('routeinfo'); route.stale = old && old.time && route.to && route.to !== to ? `${old.time}|${old.distance}` : null; } catch (e) { route.stale = null; }
-  route.to = to; route.from = fromP; route.at = Date.now(); route.min = null; route.km = null; route.txt = '';
-  try { smap.set({ from: `${fromP.lat.toFixed(5)},${fromP.lng.toFixed(5)}`, to, routemode: 'car' }); } catch (e) { /* später */ }
-  setTimeout(readRouteInfo, 1500); setTimeout(readRouteInfo, 4000); setTimeout(readRouteInfo, 6000);
-  renderCard();
-}
-function readRouteInfo() {
-  try {
-    const ri = smap && smap.get('routeinfo');
-    if (ri && ri.time) {
-      // Info der vorherigen Route ignorieren, solange die neue noch rechnet
-      if (route.stale && `${ri.time}|${ri.distance}` === route.stale && Date.now() - route.at < 5000) return;
-      const m = parseMin(ri.time);
-      if (m !== route.min || ri.distance !== route.km) { route.min = m; route.km = ri.distance; route.txt = `${ri.time} · ${ri.distance}`; updateEtaFromRoute(); renderCard(); }
+  if (!force && route.to === to && moved < 150 && Date.now() - route.at < 60000) return;
+  const changed = route.to !== to;
+  route.to = to; route.from = fromP; route.at = Date.now();
+  if (changed) { route.txt = ''; route.min = null; renderCard(); }
+  const req = ++route.req;
+  osrmRoute([fromP, tg.p]).then(r => {
+    if (req !== route.req) return;                       // inzwischen neues Ziel
+    const f = driveFactor();
+    route.geo = r.geo; route.min = Math.max(1, Math.round(r.dur * f / 60));
+    route.km = r.dist >= 1000 ? `${(r.dist / 1000).toFixed(1)} km` : `${Math.round(r.dist / 10) * 10} m`;
+    route.txt = `${route.min} min · ${route.km}`;
+    if (tg.kind === 'order') {
+      if (!lastRoute) setRoute({ geo: null, dur: 0, dist: 0, legs: [], seq: [], departAt: Date.now(), eta: {} });
+      lastRoute.eta = lastRoute.eta || {}; lastRoute.eta[tg.o.id] = Date.now() + route.min * 60000; save();
     }
-  } catch (e) { /* noch nicht da */ }
+    drawRouteLine(); renderCard();
+    if (changed && !follow) fitRoute();
+  }).catch(() => { if (req === route.req) { route.txt = ''; renderCard(); } });
 }
-// Ankunftszeit für den aktuellen Stopp aus der search.ch-Route (+ gelerntes Tempo)
-function updateEtaFromRoute() {
-  const tg = currentTarget(); if (!tg || tg.kind !== 'order' || route.min == null) return;
-  if (!lastRoute) setRoute({ geo: null, dur: 0, dist: 0, legs: [], seq: [], departAt: Date.now(), eta: {} });
-  lastRoute.eta = lastRoute.eta || {};
-  const f = driveFactor(); let t = Date.now() + route.min * 60000 * f;
-  lastRoute.eta[tg.o.id] = t; t += svcMin(tg.c) * 60000;
-  // die weiteren Stopps verschieben sich mit
-  const rest = openStops().filter(o => o.id !== tg.o.id);
-  rest.forEach((o, k) => { const old = lastRoute.eta[o.id]; if (old && k === 0) { /* Abstand grob beibehalten */ } });
-  save();
+route.req = 0;
+function drawRouteLine() {
+  if (!smap || !smap.isStyleLoaded || !smap.getStyle()) return;
+  const data = route.geo ? { type: 'Feature', properties: {}, geometry: route.geo } : { type: 'FeatureCollection', features: [] };
+  try {
+    if (smap.getSource('route')) { smap.getSource('route').setData(data); return; }
+    smap.addSource('route', { type: 'geojson', data });
+    smap.addLayer({ id: 'route-casing', type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#14210F', 'line-width': 10, 'line-opacity': .85 } });
+    smap.addLayer({ id: 'route-line', type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#8DDD58', 'line-width': 6 } });
+  } catch (e) { smap.once('idle', drawRouteLine); }
+}
+function fitRoute() {
+  if (!smap || !route.geo?.coordinates?.length) return;
+  const pts = route.geo.coordinates;
+  const bb = pts.reduce((bnd, p) => bnd.extend(p), new maplibregl.LngLatBounds(pts[0], pts[0]));
+  smap.fitBounds(bb, { padding: { top: 140, bottom: 380, left: 50, right: 50 }, pitch: 45, maxZoom: 17, duration: 900 });
 }
 function onMapClick(e) {
   $('#mapResults').hidden = true;
   if (!pick) return;
-  let lat = e.lat, lng = e.lon;
-  if ((lat == null || lng == null) && e.mx != null) { const w = lv03ToWgs(e.mx, e.my); lat = w.lat; lng = w.lng; }
-  if (lat == null) return;
+  const lat = e.lngLat.lat, lng = e.lngLat.lng;
   const c = db.customers[pick.custId]; if (!c) return endPick();
-  const p = { lat, lng };
-  if (pick.kind === 'house') { c.lat = lat; c.lng = lng; c.approx = false; } else c[pick.kind] = p;
-  save(); const id = c.id; endPick(); renderAll(); toast('Punkt gespeichert ✓');
+  if (pick.kind === 'house') { c.lat = lat; c.lng = lng; c.approx = false; } else c[pick.kind] = { lat, lng };
+  save(); const id = c.id; endPick(); renderAll(); toast('Punkt gespeichert');
   setTimeout(() => customerDialog(id), 400);
-}
-// Schweizer Landeskoordinaten (LV03) → GPS (Näherung von swisstopo)
-function lv03ToWgs(y, x) {
-  const yy = (y - 600000) / 1e6, xx = (x - 200000) / 1e6;
-  const lng = (2.6779094 + 4.728982 * yy + 0.791484 * yy * xx + 0.1306 * yy * xx * xx - 0.0436 * yy * yy * yy) * 100 / 36;
-  const lat = (16.9023892 + 3.238272 * xx - 0.270978 * yy * yy - 0.002528 * xx * xx - 0.0447 * yy * yy * xx - 0.014 * xx * xx * xx) * 100 / 36;
-  return { lat, lng };
 }
 function startPick(kind, custId) {
   pick = { kind, custId };
   showView('karte');
   const c = db.customers[custId];
-  const label = { park: '🅿️ Tippe, wo du parkierst', bell: '🔔 Tippe auf die Klingel/den Eingang', house: '🏠 Tippe auf das Haus' }[kind];
+  const label = { park: 'Tippe, wo du parkierst', bell: 'Tippe auf die Klingel / den Eingang', house: 'Tippe auf das Haus' }[kind];
   const bar = $('#pickbar'); bar.hidden = false;
-  bar.innerHTML = `<span>${label}</span><button type="button" id="pickX">Abbrechen</button>`;
+  bar.innerHTML = `<span>${ic('hand-pointing')} ${label}</span><button type="button" id="pickX">Abbrechen</button>`;
   $('#pickX').onclick = endPick;
   const p = doorPoint(c) || db.settings.base;
-  if (p && smap) smap.go({ center: [p.lat, p.lng], zoomlevel: 19 });
+  if (p && smap) setTimeout(() => smap.flyTo({ center: [p.lng, p.lat], zoom: 19, pitch: 0, bearing: 0, duration: 800 }), 100);
 }
 function endPick() { pick = null; $('#pickbar').hidden = true; }
 
+// ---------- Offizielles Schweizer Adressverzeichnis (swisstopo, gratis) ----------
+async function swissSearch(q, limit = 8, signal) {
+  const r = await fetch(`https://api3.geo.admin.ch/rest/services/api/SearchServer?searchText=${enc(q)}&type=locations&origins=address&limit=${limit}&sr=4326`, { signal });
+  const j = await r.json();
+  return (j.results || []).map(x => {
+    const a = x.attrs || {}, lab = String(a.label || '');
+    const m = lab.match(/^(.*?)\s*<b>\s*(\d{4})\s+(.+?)\s*<\/b>/);
+    const street = (m ? m[1] : lab.replace(/<[^>]+>/g, '')).trim();
+    const plz = m ? m[2] : '', ort = m ? m[3].replace(/\s+[A-Z]{2}$/, '') : '';
+    return { street, plz, ort: ort || PLZ_ORT[plz] || '', lat: +a.lat, lng: +a.lon };
+  }).filter(h => h.street && !isNaN(h.lat));
+}
 
 // ---------- Die grosse Karte unten: aktueller Kunde ----------
 function renderCard() {
@@ -1437,12 +1448,12 @@ function cardHtml() {
   return `<div class="cs ${arrived ? 'arrived' : ''} ${late > 0 ? 'late' : ''}">
     <div class="cs-top">
       <div class="cs-eta">${arrived ? `${ic('map-pin', true)}<b>Angekommen</b>` : route.txt ? `${ic('car-profile', true)}<b>${esc(rMin)}</b><span>${esc(rKm || '')}</span>` : `<span class="spin"></span><span>Route…</span>`}</div>
-      ${late > 0 ? `<span class="tag-late">${ic('clock', true)} ${late}′ spät</span>` : eta ? `<span class="tag-time">an ${tm(eta)}</span>` : ''}
+      ${late > 0 ? `<span class="tag-late">${ic('clock', true)} ${late}′</span>` : ''}
       ${open.length > 1 ? `<div class="cs-pager"><button type="button" data-act="prev" aria-label="Vorheriger">${ic('caret-left')}</button><span>${i + 1}/${open.length}</span><button type="button" data-act="next" aria-label="Nächster">${ic('caret-right')}</button></div>` : ''}
     </div>
     <div class="cs-addr">
       <span class="cs-num">${i + 1}</span>
-      <div class="cs-title"><b>${esc(c.street)}</b><small>${esc(c.plz)} ${esc(c.ort)}${o.time ? ` · <b class="due">bis ${esc(o.time)}</b>` : ''}${c.name ? ' · ' + esc(c.name) : ''}</small></div>
+      <div class="cs-title"><b>${esc(c.street)}</b><small>${esc(c.ort)}${eta ? ` · an <b class="due">${tm(eta)}</b>` : ''}${o.time ? ` · bis <b class="due">${esc(o.time)}</b>` : ''}${c.name ? ' · ' + esc(c.name) : ''}</small></div>
     </div>
     ${itemsHtml(o.items)}
     <div class="cs-info">
@@ -1501,18 +1512,24 @@ function suggest(q) {
       if (suggestCtl) suggestCtl.abort();
       suggestCtl = new AbortController();
       const b = lastPos || db.settings.base || { lat: 46.96, lng: 9.56 };
-      const r = await fetch(`https://photon.komoot.io/api/?q=${enc(q)}&limit=8&lang=de&lat=${b.lat}&lon=${b.lng}&bbox=9.2,46.75,9.95,47.15`, { signal: suggestCtl.signal });
-      const j = await r.json();
       const seen = new Set(custs.map(h => norm(h.street + h.plz))), more = [];
-      for (const f of j.features || []) {
-        const p = f.properties || {}; if (p.countrycode !== 'CH') continue;
-        const isStreet = p.osm_key === 'highway' && !p.housenumber;
-        const street = p.housenumber ? `${p.street || p.name} ${p.housenumber}` : (isStreet ? p.name : (p.street ? `${p.street}${p.housenumber ? ' ' + p.housenumber : ''}` : p.name));
-        const plz = p.postcode || '', ort = PLZ_ORT[plz] || p.city || p.district || '';
-        const key = norm(street + plz); if (!street || seen.has(key)) continue; seen.add(key);
-        const kind = p.housenumber ? 'addr' : isStreet ? 'street' : 'poi';
-        more.push({ kind, lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0], street: kind === 'poi' && p.street ? p.street + (p.housenumber ? ' ' + p.housenumber : '') : street,
-          plz, ort, title: kind === 'poi' ? p.name : street, sub: [kind === 'poi' && p.street ? p.street : '', [plz, ort].filter(Boolean).join(' ')].filter(Boolean).join(' · ') });
+      // amtliche Gebäudeadressen der Schweiz
+      for (const h of await swissSearch(q, 8, suggestCtl.signal)) {
+        const key = norm(h.street + h.plz); if (seen.has(key)) continue; seen.add(key);
+        more.push({ kind: /\d/.test(h.street) ? 'addr' : 'street', ...h, title: h.street, sub: `${h.plz} ${h.ort}` });
+      }
+      // wenn kaum Adressen: Geschäfte/Orte aus OpenStreetMap
+      if (more.length < 3) {
+        const b = lastPos || db.settings.base || { lat: 46.96, lng: 9.56 };
+        const r = await fetch(`https://photon.komoot.io/api/?q=${enc(q)}&limit=5&lang=de&lat=${b.lat}&lon=${b.lng}&bbox=9.2,46.75,9.95,47.15`, { signal: suggestCtl.signal });
+        const j = await r.json();
+        for (const f of j.features || []) {
+          const p = f.properties || {}; if (p.countrycode !== 'CH' || !p.name) continue;
+          const plz = p.postcode || '', ort = PLZ_ORT[plz] || p.city || '';
+          const street = p.street ? `${p.street}${p.housenumber ? ' ' + p.housenumber : ''}` : p.name;
+          const key = norm(p.name + plz); if (seen.has(key)) continue; seen.add(key);
+          more.push({ kind: 'poi', lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0], street, plz, ort, title: p.name, sub: [p.street || '', [plz, ort].filter(Boolean).join(' ')].filter(Boolean).join(' · ') });
+        }
       }
       if ($('#mapQ').value.trim() !== q) return;
       searchHits = [...custs, ...more].slice(0, 8); renderHits(false);
@@ -1523,7 +1540,7 @@ function pickHit(h) {
   if (!h) return;
   if (h.kind === 'street') {
     const inp = $('#mapQ'); inp.value = `${h.street} `; inp.focus(); suggest(inp.value);
-    if (smap) smap.go({ center: [h.lat, h.lng], zoomlevel: 17 }); toast('Hausnummer dazutippen', 1600); return;
+    if (smap) smap.flyTo({ center: [h.lng, h.lat], zoom: 17 }); toast('Hausnummer dazutippen', 1600); return;
   }
   $('#mapResults').hidden = true; $('#mapQ').blur(); $('#mapQ').value = '';
   // bekannter Kunde mit offener Bestellung → direkt dorthin
@@ -1534,8 +1551,7 @@ function pickHit(h) {
   const lat = h.lat ?? known?.lat, lng = h.lng ?? known?.lng;
   if (lat == null) { toast('Kein Punkt für diese Adresse'); return; }
   killPoi(searchPin);
-  searchPin = new SearchChPOI({ center: [lat, lng], title: h.street, icon: SEARCH_ICON, width: 36, height: 36 });
-  smap.addPOI(searchPin);
+  searchPin = mk({ lat, lng }, 'search', ic('plus'));
   live.target = { p: { lat, lng }, label: h.street || h.title, h: { ...h, lat, lng } };
   follow = false; renderGpsPill();
   updateRoute(true); renderCard();
@@ -1735,7 +1751,7 @@ addEventListener('offline', toastNet);
   if (!db.settings.base) geocode(SUBITO.street, SUBITO.plz, SUBITO.ort).then(p => { if (p && !db.settings.base) { db.settings.base = p; save(); renderAll(); } });
   startGps();
   let tries = 0;
-  const tryMap = () => { if (typeof SearchChMap !== 'undefined') { initMap(); renderCard(); } else if (++tries < 100) setTimeout(tryMap, 300); else toast('Karte konnte nicht laden – Internet prüfen', 4000); };
+  const tryMap = () => { if (typeof maplibregl !== 'undefined') { initMap(); renderCard(); } else if (++tries < 100) setTimeout(tryMap, 300); else toast('Karte konnte nicht laden – Internet prüfen', 4000); };
   tryMap();
   setTimeout(warmOcr, 2000);
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {

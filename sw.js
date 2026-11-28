@@ -1,6 +1,6 @@
 // Offline-Speicher für die App-Hülle (v10). Karte, Adresssuche und Routen brauchen Internet.
-const CACHE = 'subito-v12';
-const SHELL = ['./', 'index.html', 'style.css?v=12', 'app.js?v=12', 'products.js?v=12', 'subito-logo.png'];
+const CACHE = 'subito-v13';
+const SHELL = ['./', 'index.html', 'style.css?v=13', 'app.js?v=13', 'products.js?v=13', 'subito-logo.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
