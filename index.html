@@ -16,7 +16,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100..125,400..900&display=swap">
-  <link rel="stylesheet" href="style.css?v=10">
+  <link rel="stylesheet" href="style.css?v=11">
   <!-- Karte: search.ch (Schweizer Adressverzeichnis, gratis für eigene Zwecke) -->
   <script src="https://search.ch/map/api/map.js?lang=de"></script>
 </head>
@@ -35,8 +35,6 @@
       </div>
       <div id="mapResults" class="results" hidden></div>
       <div id="pickbar" class="pickbar" hidden></div>
-      <button class="fab follow" id="btnFollow" type="button" aria-label="Auf mich zentrieren">◎</button>
-      <button class="fab type" id="btnType" type="button" aria-label="Luftbild">🛰️</button>
       <div id="card" class="card-sheet"></div>
     </section>
 
@@ -76,9 +74,11 @@
   </div>
   <input id="camFallback" type="file" accept="image/*" capture="environment" hidden>
 
+  <!-- Sperrbildschirm (PIN) -->
+  <div id="lock" class="lock" hidden></div>
   <dialog id="dlg"></dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
-  <script src="app.js?v=10"></script>
+  <script src="app.js?v=11"></script>
 </body>
 </html>

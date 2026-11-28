@@ -804,74 +804,66 @@ function ensureShift() {
 function totals(dels) {
   return dels.reduce((a, d) => ({ n: a.n + 1, amount: a.amount + d.amount, tip: a.tip + d.tip, cash: a.cash + (d.pay === 'bar' ? d.amount : 0) }), { n: 0, amount: 0, tip: 0, cash: 0 });
 }
+// ---------- Ansicht: Kasse (einfach: oben das Wichtigste, Rest zum Aufklappen) ----------
 function renderSchicht() {
   const v = $('#view-schicht');
   const act = db.shifts.find(x => x.id === db.activeShift);
   const now = new Date();
-  const monthDels = db.shifts.flatMap(s => s.deliveries).filter(d => { const x = new Date(d.t); return x.getMonth() === now.getMonth() && x.getFullYear() === now.getFullYear(); });
-  const m = totals(monthDels);
-  const monthHours = db.shifts.filter(s => new Date(s.start).getMonth() === now.getMonth() && new Date(s.start).getFullYear() === now.getFullYear())
-    .reduce((a, s) => a + ((s.end || Date.now()) - s.start) / 3.6e6, 0);
-  let html = '';
-  if (act) {
-    const t = totals(act.deliveries); const h = (Date.now() - act.start) / 3.6e6;
-    html += `<h2>Laufende Schicht seit ${tm(act.start)}</h2>
-      <div class="summary">
-        <div class="stat"><b>${t.n}</b><small>Lieferungen</small></div>
-        <div class="stat"><b>${fr(t.amount)}</b><small>CHF Umsatz</small></div>
-        <div class="stat"><b>${fr(t.tip)}</b><small>CHF Trinkgeld</small></div>
+  const sameMonth = t => { const x = new Date(t); return x.getMonth() === now.getMonth() && x.getFullYear() === now.getFullYear(); };
+  const m = totals(db.shifts.flatMap(s => s.deliveries).filter(d => sameMonth(d.t)));
+  const monthHours = db.shifts.filter(s => sameMonth(s.start)).reduce((a, s) => a + ((s.end || Date.now()) - s.start) / 3.6e6, 0);
+  const t = act ? totals(act.deliveries) : null;
+  v.innerHTML = `
+    <h1 class="vh">Kasse</h1>
+    ${act ? `
+      <div class="hero">
+        <small>Bar an Subito abgeben</small>
+        <b>CHF ${fr(t.cash)}</b>
+        <div class="hero-row"><span>${t.n} Lieferungen</span><span>Trinkgeld <b>${fr(t.tip)}</b></span></div>
       </div>
+      <details class="acc"><summary>💵 Kassensturz</summary>
+        <label class="f" for="shFloat">Wechselgeld am Anfang (CHF)</label>
+        <input id="shFloat" inputmode="decimal" value="${act.float ? fr(act.float) : ''}" placeholder="z. B. 100">
+        <table class="t mt">
+          <tr><td>Wechselgeld</td><td class="r">${fr(act.float)}</td></tr>
+          <tr><td>+ Bar kassiert</td><td class="r">${fr(t.cash)}</td></tr>
+          <tr><td>+ Trinkgeld</td><td class="r">${fr(t.tip)}</td></tr>
+          <tr><th>= In der Tasche</th><th class="r">${fr((+act.float || 0) + t.cash + t.tip)}</th></tr>
+        </table>
+        <p class="hint">Seit ${tm(act.start)} · Umsatz CHF ${fr(t.amount)}</p>
+      </details>
+      <button class="btn block big mt" data-act="end" type="button">Schicht beenden</button>`
+    : `<div class="hero light"><small>Heute</small><b>Noch keine Lieferung</b><div class="hero-row"><span>Die Schicht startet automatisch bei der ersten Lieferung.</span></div></div>`}
+    <details class="acc"><summary>📅 Diesen Monat · ${m.n} Lieferungen</summary>
       <div class="summary">
-        <div class="stat"><b>${fr(t.cash)}</b><small>CHF bar kassiert</small></div>
-        <div class="stat"><b>${h.toFixed(1)}</b><small>Stunden</small></div>
-        <div class="stat"><b>${h > 0.1 ? fr(t.tip / h) : '–'}</b><small>Trinkgeld / Std.</small></div>
+        <div class="stat"><b>${fr(m.amount)}</b><small>Umsatz</small></div>
+        <div class="stat"><b>${fr(m.tip)}</b><small>Trinkgeld</small></div>
+        <div class="stat"><b>${monthHours > 0.1 ? fr(m.tip / monthHours) : '–'}</b><small>Trinkgeld/Std.</small></div>
       </div>
-      <h2>💵 Kassensturz</h2>
-      <label class="f" for="shFloat">Wechselgeld am Anfang (CHF)</label>
-      <input id="shFloat" inputmode="decimal" value="${act.float ? fr(act.float) : ''}" placeholder="z. B. 100">
-      <table class="t mt">
-        <tr><td>Wechselgeld am Anfang</td><td class="r">${fr(act.float)}</td></tr>
-        <tr><td>+ Bar kassiert (an Subito abgeben)</td><td class="r">${fr(t.cash)}</td></tr>
-        <tr><td>+ Trinkgeld (gehört dir)</td><td class="r">${fr(t.tip)}</td></tr>
-        <tr><th>= Sollte in der Tasche sein</th><th class="r">${fr((+act.float || 0) + t.cash + t.tip)}</th></tr>
-      </table>
-      <p class="hint">Annahme: Trinkgeld bekommst du bar. Weicht deine Tasche ab, stimmt irgendwo ein Rückgeld nicht.</p>
-      <button class="btn block" data-act="end" type="button">Schicht beenden</button>`;
-  } else {
-    html += `<h2>Keine Schicht aktiv</h2><p class="hint">Startet automatisch bei der ersten Lieferung.</p>
-      <button class="btn primary block" data-act="start" type="button">Schicht starten</button>`;
-  }
-  html += `<h2>Diesen Monat</h2>
-    <div class="summary">
-      <div class="stat"><b>${m.n}</b><small>Lieferungen</small></div>
-      <div class="stat"><b>${fr(m.amount)}</b><small>CHF Umsatz</small></div>
-      <div class="stat"><b>${fr(m.tip)}</b><small>CHF Trinkgeld</small></div>
-    </div>
-    <p class="hint">${monthHours.toFixed(1)} Stunden erfasst${monthHours > 0.1 ? ` · ${fr(m.tip / monthHours)} Trinkgeld pro Stunde` : ''}</p>
-    <h2>Letzte Schichten</h2>
-    ${db.shifts.length ? `<table class="t"><tr><th>Datum</th><th class="r">Lief.</th><th class="r">Umsatz</th><th class="r">Trinkg.</th></tr>
-      ${db.shifts.slice(-15).reverse().map(s => { const t = totals(s.deliveries); return `<tr><td>${dt(s.start)} ${tm(s.start)}</td><td class="r">${t.n}</td><td class="r">${fr(t.amount)}</td><td class="r">${fr(t.tip)}</td></tr>`; }).join('')}</table>` : '<div class="empty">Noch keine Schichten.</div>'}
-    <button class="btn block mt" data-act="csv" type="button">Als Tabelle (CSV) exportieren</button>`;
-  v.innerHTML = html;
+      ${db.shifts.length ? `<table class="t mt"><tr><th>Datum</th><th class="r">Lief.</th><th class="r">Trinkg.</th></tr>
+        ${db.shifts.slice(-12).reverse().map(s => { const x = totals(s.deliveries); return `<tr><td>${dt(s.start)}</td><td class="r">${x.n}</td><td class="r">${fr(x.tip)}</td></tr>`; }).join('')}</table>` : ''}
+      <button class="btn block mt" data-act="csv" type="button">Als Tabelle exportieren</button>
+    </details>`;
 }
 $('#view-schicht').addEventListener('change', e => {
   if (e.target.id !== 'shFloat') return;
   const s = db.shifts.find(x => x.id === db.activeShift); if (!s) return;
   s.float = +e.target.value.replace(',', '.') || 0; save(); renderSchicht();
+  const d = $('#view-schicht details'); if (d) d.open = true;
 });
 $('#view-schicht').addEventListener('click', e => {
   const b = e.target.closest('[data-act]'); if (!b) return;
-  if (b.dataset.act === 'start') { ensureShift(); save(); renderSchicht(); toast('Schicht gestartet – gute Fahrt! 🛵'); }
   if (b.dataset.act === 'end') {
     const s = db.shifts.find(x => x.id === db.activeShift); if (!s) return;
     const t = totals(s.deliveries);
-    if (!confirm(`Schicht beenden?\n${t.n} Lieferungen · CHF ${fr(t.amount)} Umsatz · CHF ${fr(t.tip)} Trinkgeld\nBar an Subito abgeben: CHF ${fr(t.cash)}\nIn der Tasche sollten sein: CHF ${fr((+s.float || 0) + t.cash + t.tip)}`)) return;
+    if (!confirm(`Schicht beenden?\n${t.n} Lieferungen · Trinkgeld CHF ${fr(t.tip)}\nBar an Subito abgeben: CHF ${fr(t.cash)}`)) return;
     s.end = Date.now(); db.activeShift = null; db.tour = openStops(); save(); renderSchicht(); renderTour();
   }
   if (b.dataset.act === 'csv') {
-    const rows = [['Datum', 'Zeit', 'Adresse', 'Betrag', 'Zahlung', 'Trinkgeld']];
-    db.shifts.forEach(s => s.deliveries.forEach(d => rows.push([dt(d.t), tm(d.t), d.addr, fr(d.amount), payLabel(d.pay), fr(d.tip)])));
-    download('kurier-lieferungen.csv', rows.map(r => r.map(x => `"${String(x).replace(/"/g, '""')}"`).join(';')).join('\n'), 'text/csv');
+    const rows = [['Datum', 'Zeit', 'Ort', 'Betrag', 'Zahlung', 'Trinkgeld']];
+    // Datenschutz: nur Ort, keine Strasse/Namen in der Tabelle
+    db.shifts.forEach(s => s.deliveries.forEach(d => rows.push([dt(d.t), tm(d.t), (d.addr || '').split(',').pop().trim(), fr(d.amount), payLabel(d.pay), fr(d.tip)])));
+    download('subito-lieferungen.csv', rows.map(r => r.map(x => `"${String(x).replace(/"/g, '""')}"`).join(';')).join('\n'), 'text/csv');
   }
 });
 function download(name, text, type) {
@@ -881,45 +873,53 @@ function download(name, text, type) {
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
 
-// ---------- Ansicht: Mehr / Einstellungen ----------
+// ---------- Ansicht: Mehr (einfaches Menü zum Aufklappen) ----------
 function renderEinst() {
   const s = db.settings;
   const v = $('#view-einst');
+  const nCust = Object.keys(db.customers).length;
   v.innerHTML = `
     <h1 class="vh">Mehr</h1>
-    <button class="btn block big" type="button" data-open-kunden>👤 Kunden & Notizen</button>
-    <h2>Restaurant (Startpunkt)</h2>
-    <p class="hint">${SUBITO.name}, ${SUBITO.street}, ${SUBITO.plz} ${SUBITO.ort} · <a href="tel:${SUBITO.phone}">081 322 20 20</a></p>
-    <p class="hint">${s.base ? '✓ Standort gesetzt' : '⚠️ Standort noch nicht gesetzt'}</p>
-    <div class="row">
-      <button class="btn sm" data-act="basegeo" type="button">Adresse suchen</button>
-      <button class="btn sm" data-act="basegps" type="button">Ich bin bei Subito (GPS)</button>
-    </div>
-    <h2>Route</h2>
-    <label class="toggle"><input type="checkbox" id="sRound" ${s.roundtrip ? 'checked' : ''}> Route zurück zu Subito mitrechnen (Standard: aus)</label>
-    <label class="toggle"><input type="checkbox" id="sGps" ${s.startFromGps ? 'checked' : ''}> Route ab meinem Standort (statt ab Subito)</label>
-    <h2>Gelernt</h2>
-    <p class="hint">Fahrtempo: ${db.learn?.driveN ? `${Math.round((driveFactor() - 1) * 100)} % gegenüber Berechnung (aus ${db.learn.driveN} Fahrten)` : 'noch keine Fahrten gemessen'}<br>
-      Übergabezeit im Schnitt: ${fr(svcMin(null)).replace('.00', '')} Min</p>
-    <label class="f" for="sNav">Navi-App</label>
-    <select id="sNav">
-      <option value="google" ${s.navApp === 'google' ? 'selected' : ''}>Google Maps</option>
-      <option value="apple" ${s.navApp === 'apple' ? 'selected' : ''}>Apple Karten</option>
-      <option value="waze" ${s.navApp === 'waze' ? 'selected' : ''}>Waze</option>
-    </select>
-    <h2>Liefergebiet & Mindestbestellwert</h2>
-    <table class="t">${Object.entries(ORTE).map(([o, m]) => `<tr><td>${esc(o)}</td><td class="r">${m}.–</td></tr>`).join('')}</table>
-    <h2>Daten sichern</h2>
-    <p class="hint">Alles ist nur auf diesem Handy gespeichert. Mach ab und zu ein Backup.</p>
-    <div class="row">
-      <button class="btn sm" data-act="backup" type="button">Backup speichern</button>
-      <label class="btn sm">Backup laden<input type="file" id="sImport" accept="application/json" hidden></label>
-    </div>
-    <button class="btn sm danger block mt" data-act="wipe" type="button">Alle Daten löschen</button>
-    <p class="hint mt">Karten © OpenStreetMap-Mitwirkende · Routen: OSRM · Adresssuche: Nominatim</p>`;
+    <button class="menu-row" type="button" data-open-kunden><span>👤</span><b>Kunden & Notizen</b><small>${nCust}</small><i>›</i></button>
+    <details class="acc"><summary>🔒 Datenschutz & Sperre</summary>
+      <div class="priv">
+        <p><b>Kundendaten bleiben auf diesem Handy.</b> Namen, Telefonnummern, Notizen und Zettel-Fotos werden nirgends hochgeladen. Die Texterkennung läuft direkt auf dem Handy.</p>
+        <p class="hint">Ins Internet geht nur, was für Karte und Route nötig ist: die <b>Adresse</b> (search.ch, Photon) und Koordinaten (OSRM) – nie Name oder Telefon.</p>
+      </div>
+      <label class="f">App-Sperre mit PIN</label>
+      <div class="row">${s.pinHash
+        ? '<button class="btn" data-act="pinchange" type="button">PIN ändern</button><button class="btn danger" data-act="pinoff" type="button">Sperre aus</button>'
+        : '<button class="btn primary" data-act="pinset" type="button">🔒 PIN festlegen</button>'}</div>
+      <p class="hint">Sperrt die App beim Öffnen und nach 5 Minuten im Hintergrund.</p>
+      <label class="f" for="sKeep">Kundendaten automatisch löschen nach</label>
+      <select id="sKeep">
+        ${[[30, '30 Tagen ohne Lieferung'], [90, '90 Tagen ohne Lieferung'], [180, '180 Tagen ohne Lieferung'], [0, 'nie']].map(([d, l]) => `<option value="${d}" ${(s.keepDays ?? 90) === d ? 'selected' : ''}>${l}</option>`).join('')}
+      </select>
+      <p class="hint">Alte Lieferungen behalten nur Betrag & Trinkgeld, die Adresse wird entfernt.</p>
+      <button class="btn danger block mt" data-act="wipe" type="button">Alle Daten löschen</button>
+    </details>
+    <details class="acc"><summary>💾 Backup</summary>
+      <p class="hint">Das Backup enthält Kundendaten – nur auf deinem eigenen Handy/Mac speichern, nicht weiterschicken.</p>
+      <div class="row">
+        <button class="btn" data-act="backup" type="button">Speichern</button>
+        <label class="btn">Laden<input type="file" id="sImport" accept="application/json" hidden></label>
+      </div>
+    </details>
+    <details class="acc"><summary>🍕 Subito & Route</summary>
+      <p class="hint">${SUBITO.name}, ${SUBITO.street}, ${SUBITO.plz} ${SUBITO.ort} · <a href="tel:${SUBITO.phone}">081 322 20 20</a><br>${s.base ? '✓ Standort gesetzt' : '⚠️ Standort fehlt'}</p>
+      <div class="row">
+        <button class="btn sm" data-act="basegeo" type="button">Adresse suchen</button>
+        <button class="btn sm" data-act="basegps" type="button">Ich bin bei Subito</button>
+      </div>
+      <label class="toggle"><input type="checkbox" id="sRound" ${s.roundtrip ? 'checked' : ''}> Rückfahrt zu Subito in der Planung mitrechnen</label>
+      <p class="hint">Gelernt: Fahrtempo ${db.learn?.driveN ? `${Math.round((driveFactor() - 1) * 100)} % (aus ${db.learn.driveN} Fahrten)` : 'noch offen'} · Übergabe Ø ${fr(svcMin(null)).replace('.00', '')} Min</p>
+    </details>
+    <details class="acc"><summary>📍 Liefergebiet</summary>
+      <table class="t">${Object.entries(ORTE).map(([o, m]) => `<tr><td>${esc(o)}</td><td class="r">ab ${m}.–</td></tr>`).join('')}</table>
+    </details>
+    <p class="hint credits">Karte © search.ch, swisstopo · Adressen © OpenStreetMap (Photon/Nominatim) · Routenplanung OSRM</p>`;
   $('#sRound', v).onchange = e => { s.roundtrip = e.target.checked; save(); };
-  $('#sGps', v).onchange = e => { s.startFromGps = e.target.checked; save(); };
-  $('#sNav', v).onchange = e => { s.navApp = e.target.value; save(); renderTour(); };
+  $('#sKeep', v).onchange = e => { s.keepDays = +e.target.value; save(); const n = applyRetention(); toast(n ? `${n} alte Kunden gelöscht` : 'Gespeichert ✓'); };
   $('#sImport', v).onchange = async e => {
     const f = e.target.files[0]; if (!f) return;
     try {
@@ -936,20 +936,98 @@ $('#view-einst').addEventListener('click', async e => {
   if (a === 'basegeo') {
     toast('Suche Subito…');
     const p = await geocode(SUBITO.street, SUBITO.plz, SUBITO.ort);
-    if (p) { db.settings.base = p; save(); renderEinst(); drawMap(); toast('Standort gesetzt ✓ – auf der Karte prüfen'); }
-    else toast('Nicht gefunden – nimm „Ich bin bei Subito (GPS)“');
+    if (p) { db.settings.base = p; save(); renderEinst(); drawMap(); toast('Standort gesetzt ✓'); }
+    else toast('Nicht gefunden – nimm „Ich bin bei Subito“');
   }
   if (a === 'basegps') {
-    try { const p = await gps(); db.settings.base = { lat: p.lat, lng: p.lng }; save(); renderEinst(); drawMap(); toast('Standort gesetzt ✓'); }
+    try { const p = lastPos && Date.now() - lastPos.t < 60000 ? lastPos : await gps(); db.settings.base = { lat: p.lat, lng: p.lng }; save(); renderEinst(); drawMap(); toast('Standort gesetzt ✓'); }
     catch (err) { toast('GPS nicht verfügbar'); }
   }
-  if (a === 'backup') download(`kurier-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(db), 'application/json');
+  if (a === 'backup') download(`subito-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(db), 'application/json');
   if (a === 'wipe' && confirm('Wirklich ALLE Kunden, Notizen und Schichten löschen? Das kann man nicht rückgängig machen.')) {
-    localStorage.removeItem(KEY); db = structuredClone(EMPTY); lastRoute = null; refreshAll(); toast('Alles gelöscht');
+    const keep = { pinHash: db.settings.pinHash };
+    localStorage.removeItem(KEY); db = structuredClone(EMPTY); Object.assign(db.settings, keep); lastRoute = null; save(); refreshAll(); renderEinst(); toast('Alles gelöscht');
   }
+  if (a === 'pinset' || a === 'pinchange') setPin();
+  if (a === 'pinoff') { const ok = await askPin('Aktuelle PIN'); if (ok) { delete db.settings.pinHash; save(); renderEinst(); toast('Sperre aus'); } }
 });
 
+// ---------- Datenschutz: automatisch löschen ----------
+function applyRetention() {
+  const days = db.settings.keepDays ?? 90; if (!days) return 0;
+  const cut = Date.now() - days * 864e5;
+  const openIds = new Set(db.tour.map(o => o.custId));
+  let n = 0;
+  for (const [id, c] of Object.entries(db.customers)) {
+    const last = custStats(c).last || c.created || 0;
+    if (!openIds.has(id) && last < cut) { delete db.customers[id]; n++; }
+  }
+  db.shifts.forEach(s => s.deliveries.forEach(d => { if (d.t < cut && (d.addr || d.custId)) { d.addr = ''; d.custId = ''; } }));
+  save();
+  return n;
+}
 
+// ---------- Datenschutz: PIN-Sperre ----------
+async function hashPin(pin) {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('subito-kurier:' + pin));
+  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+// Zeigt das PIN-Feld. resolve(pin) oder resolve(null) bei Abbruch
+function pinPad(title, cancelable) {
+  return new Promise(resolve => {
+    const el = $('#lock'); let pin = '';
+    el.hidden = false;
+    el.innerHTML = `<div class="lk">
+      <img src="subito-logo.png" alt="Subito" class="lk-logo">
+      <b class="lk-t">${esc(title)}</b>
+      <div class="lk-dots">${'<i></i>'.repeat(4)}</div>
+      <div class="lk-pad">${[1, 2, 3, 4, 5, 6, 7, 8, 9, '', 0, '⌫'].map(k => k === '' ? (cancelable ? '<button type="button" data-k="x" class="lk-c">Abbr.</button>' : '<span></span>') : `<button type="button" data-k="${k}">${k}</button>`).join('')}</div>
+    </div>`;
+    const dots = () => $$('.lk-dots i', el).forEach((d, i) => d.classList.toggle('on', i < pin.length));
+    el.onclick = e => {
+      const b = e.target.closest('[data-k]'); if (!b) return;
+      const k = b.dataset.k;
+      navigator.vibrate?.(10);
+      if (k === 'x') { el.hidden = true; el.onclick = null; resolve(null); return; }
+      if (k === '⌫') pin = pin.slice(0, -1); else if (pin.length < 4) pin += k;
+      dots();
+      if (pin.length === 4) setTimeout(() => { el.onclick = null; resolve(pin); }, 120);
+    };
+  });
+}
+function lockShake(msg) { const el = $('#lock .lk'); if (!el) return; $('.lk-t', el).textContent = msg; el.classList.remove('shake'); void el.offsetWidth; el.classList.add('shake'); }
+async function askPin(title) {
+  for (let i = 0; i < 5; i++) {
+    const p = await pinPad(i ? 'Falsche PIN – nochmal' : title, true);
+    if (p == null) return false;
+    if (await hashPin(p) === db.settings.pinHash) { $('#lock').hidden = true; return true; }
+  }
+  $('#lock').hidden = true; return false;
+}
+async function setPin() {
+  const a = await pinPad('Neue PIN (4 Ziffern)', true); if (a == null) { $('#lock').hidden = true; return; }
+  const b = await pinPad('PIN wiederholen', true); if (b == null) { $('#lock').hidden = true; return; }
+  $('#lock').hidden = true;
+  if (a !== b) { toast('PINs stimmen nicht überein'); return; }
+  db.settings.pinHash = await hashPin(a); save(); renderEinst(); toast('🔒 App-Sperre aktiv');
+}
+let unlocking = false;
+async function lockApp() {
+  if (!db.settings.pinHash || unlocking) return;
+  unlocking = true;
+  let wrong = 0;
+  for (;;) {
+    const p = await pinPad(wrong ? 'Falsche PIN' : 'PIN eingeben', false);
+    if (await hashPin(p) === db.settings.pinHash) break;
+    wrong++;
+    if (wrong >= 5) { $('#lock .lk-t') && ($('#lock .lk-t').textContent = '30 Sekunden warten…'); await sleep(30000); wrong = 0; }
+  }
+  $('#lock').hidden = true; unlocking = false;
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') db.settings.hiddenAt = Date.now(), save();
+  else if (db.settings.pinHash && Date.now() - (db.settings.hiddenAt || 0) > 5 * 60000) lockApp();
+});
 
 // =====================================================================
 //  v10 – NEUE OBERFLÄCHE: Karte (search.ch) · GPS-Tracker · Kamera · Liste
@@ -1054,12 +1132,12 @@ function detectArrival(pos) {
 function renderGpsPill() {
   const b = $('#gpsPill'); if (!b) return;
   const s = gpsState.status;
-  b.className = 'gps ' + s;
+  b.className = 'gps ' + s + (follow && s === 'ok' ? ' follow' : '');
   $('.g-txt', b).textContent = s === 'ok' ? `±${Math.round(lastPos?.acc || 0)} m` : s === 'search' ? 'sucht…' : s === 'denied' ? 'GPS aus' : s === 'none' ? 'kein GPS' : 'GPS ?';
 }
 $('#gpsPill').addEventListener('click', () => {
   const s = gpsState.status;
-  if (s === 'ok') { follow = true; $('#btnFollow').classList.add('on'); if (smap && lastPos) smap.go({ center: [lastPos.lat, lastPos.lng], zoomlevel: 17 }); return; }
+  if (s === 'ok') { follow = !follow; renderGpsPill(); if (follow && smap && lastPos) smap.go({ center: [lastPos.lat, lastPos.lng], zoomlevel: 18 }); if (!follow) updateRoute(true); toast(follow ? '◎ Karte folgt dir' : 'Folgen aus'); return; }
   openDialog(`
     <h3>Standort (GPS)</h3>
     <p>${s === 'denied' ? 'Dein Handy blockiert den Standort für diese App.' : 'Die App sucht deinen Standort.'}</p>
@@ -1078,12 +1156,14 @@ function initMap() {
   const b = db.settings.base;
   smap = map = new SearchChMap({
     container: 'map', center: lastPos ? [lastPos.lat, lastPos.lng] : b ? [b.lat, b.lng] : 'Landquart',
-    zoomlevel: 15, type: db.settings.mapType === 'aerial' ? 'aerial' : 'street', controls: '', marker: false, gestureHandling: 'greedy'
+    zoomlevel: 16, type: 'aerial', controls: '', marker: false, gestureHandling: 'greedy'
   });
-  smap.addEventListener('dragstart', () => { if (follow) { follow = false; $('#btnFollow').classList.remove('on'); } });
-  smap.addEventListener('maptypechanged', () => { try { db.settings.mapType = smap.get('type'); save(); } catch (e) { /* egal */ } });
+  smap.addEventListener('dragstart', () => { if (follow) { follow = false; renderGpsPill(); } });
   smap.addEventListener('change', () => readRouteInfo());
   smap.addEventListener('mouseclick', onMapClick);
+  // Nur echtes Luftbild
+  const aerial = () => { try { if (smap.get('type') !== 'aerial') smap.set({ type: 'aerial' }); } catch (e) { /* egal */ } };
+  aerial(); setTimeout(aerial, 800); smap.addEventListener('load', aerial);
   renderMapPois();
   if (lastPos) showMe(lastPos);
   updateRoute(true);
@@ -1148,7 +1228,8 @@ function updateRoute(force) {
   const to = routeTarget(tg);
   const moved = route.from ? hav(route.from, fromP) * 1000 : 1e9;
   if (!force && route.to === to && moved < 250 && Date.now() - route.at < 90000) return;
-  try { const old = smap.get('routeinfo'); route.stale = old && old.time ? `${old.time}|${old.distance}` : null; } catch (e) { route.stale = null; }
+  // Alte Routeninfo nur ignorieren, wenn sich das Ziel geändert hat
+  try { const old = smap.get('routeinfo'); route.stale = old && old.time && route.to && route.to !== to ? `${old.time}|${old.distance}` : null; } catch (e) { route.stale = null; }
   route.to = to; route.from = fromP; route.at = Date.now(); route.min = null; route.km = null; route.txt = '';
   try { smap.set({ from: `${fromP.lat.toFixed(5)},${fromP.lng.toFixed(5)}`, to, routemode: 'car' }); } catch (e) { /* später */ }
   setTimeout(readRouteInfo, 1500); setTimeout(readRouteInfo, 4000); setTimeout(readRouteInfo, 6000);
@@ -1208,17 +1289,7 @@ function startPick(kind, custId) {
   if (p && smap) smap.go({ center: [p.lat, p.lng], zoomlevel: 19 });
 }
 function endPick() { pick = null; $('#pickbar').hidden = true; }
-// Karte ↔ Luftbild
-$('#btnType').addEventListener('click', () => {
-  if (!smap) return;
-  db.settings.mapType = db.settings.mapType === 'aerial' ? 'street' : 'aerial'; save();
-  smap.set({ type: db.settings.mapType }); $('#btnType').classList.toggle('on', db.settings.mapType === 'aerial');
-});
-$('#btnFollow').addEventListener('click', () => {
-  follow = !follow; $('#btnFollow').classList.toggle('on', follow);
-  if (follow && lastPos && smap) smap.go({ center: [lastPos.lat, lastPos.lng], zoomlevel: 17 });
-  if (!follow) updateRoute(true);
-});
+
 
 // ---------- Die grosse Karte unten: aktueller Kunde ----------
 function renderCard() {
@@ -1256,11 +1327,11 @@ function cardHtml() {
     </div>
     <div class="cs-route">${arrived ? '<b class="arr">📍 Angekommen</b>' : route.txt ? `🚗 <b>${esc(route.txt)}</b>` : '🚗 Route wird berechnet…'}${eta ? ` · an <b>${tm(eta)}</b>` : ''}${o.time ? ` · 🕗 ${esc(o.time)}` : ''}${late > 0 ? ` · <span class="lt">${late}′ zu spät</span>` : ''}</div>
     <div class="cs-info">
-      <span class="pill ${cash ? 'cash' : ''}">${cash ? `💵 ${fr(o.amount)} kassieren` : `${payLabel(o.pay)} · CHF ${fr(o.amount)}`}</span>
-      ${(c.tags || []).map(t => `<span class="pill warn">${esc(t)}</span>`).join('')}
-      ${o.note ? `<span class="pill">🧾 ${esc(o.note)}</span>` : ''}
+      <span class="pill ${cash ? 'cash' : ''}">${cash ? `💵 ${fr(o.amount)} kassieren` : `${payLabel(o.pay)} · ${fr(o.amount)}`}</span>
+      ${arrived ? (c.tags || []).map(t => `<span class="pill warn">${esc(t)}</span>`).join('') : (c.tags || []).length ? `<span class="pill warn">⚠️ ${c.tags.length}</span>` : ''}
+      ${arrived && o.note ? `<span class="pill">🧾 ${esc(o.note)}</span>` : ''}
     </div>
-    ${c.notes ? `<div class="cs-note">📝 ${esc(c.notes)}</div>` : ''}
+    ${arrived && c.notes ? `<div class="cs-note">📝 ${esc(c.notes)}</div>` : ''}
     <div class="cs-btns">
       ${c.phone ? `<a class="btn call" href="tel:${esc(c.phone)}">${late > 0 ? '📞 Bescheid geben' : '📞'}</a>` : ''}
       <button class="btn primary big ${arrived ? 'pulse' : ''}" type="button" data-done="${o.id}">✓ Geliefert</button>
@@ -1347,7 +1418,7 @@ function pickHit(h) {
   searchPin = new SearchChPOI({ center: [lat, lng], title: h.street, icon: SEARCH_ICON, width: 36, height: 36 });
   smap.addPOI(searchPin);
   live.target = { p: { lat, lng }, label: h.street || h.title, h: { ...h, lat, lng } };
-  follow = false; $('#btnFollow').classList.remove('on');
+  follow = false; renderGpsPill();
   updateRoute(true); renderCard();
 }
 $('#mapSearch').addEventListener('submit', e => { e.preventDefault(); if (searchHits.length) pickHit(searchHits[0]); });
@@ -1468,17 +1539,9 @@ function renderList() {
   const cash = open.filter(o => o.pay === 'bar').reduce((a, o) => a + (+o.amount || 0), 0);
   const tg = currentTarget();
   v.innerHTML = `
-    <h1 class="vh">Liste</h1>
-    <div class="summary">
-      <div class="stat"><b>${open.length}</b><small>offen</small></div>
-      <div class="stat"><b>${fr(sum)}</b><small>CHF total</small></div>
-      <div class="stat"><b>${fr(cash)}</b><small>bar kassieren</small></div>
-    </div>
-    <div class="row">
-      <button class="btn primary big" type="button" data-act="cam">📷 Scannen</button>
-      <button class="btn" type="button" data-act="add">＋ Von Hand</button>
-      ${open.length > 1 ? '<button class="btn" type="button" data-act="opt">⚡ Sortieren</button>' : ''}
-    </div>
+    <div class="vh-row"><h1 class="vh">Liste</h1>
+      <div>${open.length > 1 ? '<button class="ic big" type="button" data-act="opt" aria-label="Neu sortieren">⚡</button>' : ''}<button class="ic big dark" type="button" data-act="add" aria-label="Von Hand">＋</button></div></div>
+    ${open.length ? `<p class="hint">${open.length} offen · CHF ${fr(sum)}${cash ? ` · 💵 ${fr(cash)} bar` : ''}</p>` : ''}
     ${open.length ? `<ol class="rows">${open.map((o, i) => {
       const c = db.customers[o.custId] || {}, late = lateBy(o), eta = lastRoute?.eta?.[o.id], isT = tg && tg.o && tg.o.id === o.id;
       return `<li class="rw ${isT ? 'now' : ''}" data-go="${o.id}">
@@ -1533,6 +1596,8 @@ addEventListener('offline', toastNet);
 //  START
 // =====================================================================
 (function start() {
+  if (db.settings.pinHash) lockApp();
+  applyRetention();
   renderBadge();
   if (!db.settings.base) geocode(SUBITO.street, SUBITO.plz, SUBITO.ort).then(p => { if (p && !db.settings.base) { db.settings.base = p; save(); renderAll(); } });
   startGps();
