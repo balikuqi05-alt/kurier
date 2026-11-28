@@ -36,10 +36,6 @@ const enc = encodeURIComponent;
 const dt = t => new Date(t).toLocaleDateString('de-CH', { day: '2-digit', month: '2-digit', year: '2-digit' });
 const tm = t => new Date(t).toLocaleTimeString('de-CH', { hour: '2-digit', minute: '2-digit' });
 
-function toast(msg, ms = 2600) {
-  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
-  clearTimeout(toast._h); toast._h = setTimeout(() => t.classList.remove('show'), ms);
-}
 
 // ---------- Speicher ----------
 const KEY = 'kurier.v1';
@@ -223,7 +219,7 @@ function parseOrder(text) {
   const out = { name: '', street: '', plz: '', ort: '', phone: '', amount: '', pay: '', time: '', etage: '', ref: '' };
   const phoneRe = /(?:\+41|0041|0)\s?\(?0?\)?\s?([1-9]\d)[\s./-]?(\d{3})[\s./-]?(\d{2})[\s./-]?(\d{2})\b/;
   const plzRe = /\b(\d{4})\s+([A-ZÄÖÜ][A-Za-zÄÖÜäöüéèàç .\-]{1,30})/;
-  const streetRe = /([A-Za-zÄÖÜäöüéèàç.\-' ]{3,40}?)\s+(\d{1,4}\s?[a-zA-Z]?)\b/;
+  const streetRe = /([A-Za-zÄÖÜäöüéèàç.\-' ]{3,40}?)\s+(\d{1,4}[a-zA-Z]?)\b/;
   const streetWord = /(str|weg|gasse|platz|rain|halde|quai|allee|ring|hof|matt|acker|bühl|buehl|feld|via|park|berg|dorf|boden|wiese|egg|rank|zelg|gut|au)\b|strasse/i;
   const isDate = l => /\d{1,2}\.\d{1,2}\.\d{2,4}/.test(l);
 
@@ -240,7 +236,7 @@ function parseOrder(text) {
   }
   if (pi < 0) pi = lines.findIndex(l => { const m = l.match(plzRe); return m && +m[1] >= 1000 && !isDate(l) && !phoneRe.test(l); });
   if (si < 0 && pi > 0) { const m = lines[pi - 1].match(streetRe); if (m && !phoneRe.test(lines[pi - 1])) si = pi - 1; }
-  if (si >= 0) { const m = lines[si].match(streetRe); out.street = `${m[1].trim()} ${m[2]}`.replace(/\s+/g, ' '); }
+  if (si >= 0) { const m = lines[si].match(streetRe); out.street = cleanStreet(`${m[1].trim()} ${m[2]}`); }
   if (pi >= 0) { const m = lines[pi].match(plzRe); out.plz = m[1]; out.ort = m[2].trim().replace(/\s+(\d|lieferzeit).*$/i, ''); }
 
   // 4) Telefon und Etage: erst im Kundenblock, nach der Strasse
@@ -255,6 +251,7 @@ function parseOrder(text) {
     let nm = lines[si - 1].replace(/kunden.?adresse|lieferzeit:?|kopie/ig, '').replace(/\d{1,2}[:.]\d{2}/g, '').trim();
     const words = nm.split(/\s+/).filter(Boolean);
     while (words.length > 2 && (words[words.length - 1].length <= 2 || /^[A-ZÄÖÜ]{2,3}$/.test(words[words.length - 1]))) words.pop();
+    while (words.length > 2 && words[0].length <= 2 && !/\.$/.test(words[0])) words.shift();
     nm = words.filter(w => !(w.length === 1)).join(' ');
     if (/^[A-Za-zÄÖÜäöüéèàç.' \-]{3,40}$/.test(nm) && !streetWord.test(nm)) out.name = nm;
   }
@@ -278,12 +275,81 @@ function parseOrder(text) {
   if (nums.length) out.amount = fr(Math.max(...nums));
   const rf = text.match(/\b(?:ref|rat|rof|rel)\.?\s*:?\s*(\d{5,})/i); if (rf) out.ref = rf[1];
 
-  // 9) Ort angleichen + Sicherung: niemals die Subito-Adresse als Kunde
+  // 9) Bestellte Produkte (mit Bildern von subitopizzakurier.ch)
+  out.items = parseItems(all);
+
+  // 10) Ort angleichen + Sicherung: niemals die Subito-Adresse als Kunde
   out.ort = matchOrt(out.ort, out.plz);
   if (/^kantons?.?str/i.test(norm(out.street)) && /^24\b/.test(out.street.replace(/^\D+/, '')) || (out.plz === '7302' && /kanton/i.test(out.street))) {
     out.street = ''; out.plz = ''; out.ort = '';
   }
   return out;
+}
+
+// Strasse säubern: OCR-Krümel vorne, falsche Endungen
+function cleanStreet(st) {
+  let w = st.replace(/\s+/g, ' ').trim().split(' ');
+  while (w.length > 2 && w[0].length <= 2 && !/\.$/.test(w[0])) w.shift();
+  st = w.join(' ');
+  return st.replace(/strass\b/i, 'strasse').replace(/strase\b/i, 'strasse').replace(/str\b(?!\.)/i, 'str.');
+}
+
+// ---------- Produkte auf dem Zettel erkennen ----------
+// Zeilen wie „1 KEBAB 12.90 12.90“, darunter Zusätze („Knoblauch Sauce“). Stopp bei Zwischensumme/Total.
+function parseItems(all) {
+  const items = [];
+  const stop = /zwischensumme|^total|ergänzung|erganzung|bezahlt|zu\s*bezahlen|mindestbestell/i;
+  const head = /^\s*(\d{1,2})\s*[x×*]?\s+(.+)$/;
+  let started = false;
+  for (const raw of all) {
+    const l = raw.replace(/\s+/g, ' ').trim();
+    if (started && stop.test(l)) break;
+    const m = l.match(head);
+    if (m && +m[1] > 0 && +m[1] < 30 && !/^\d{4}\b/.test(l)) {
+      let name = m[2].replace(/(\s*-?\d+[.,]\d{2})+\s*$/, '').replace(/[^A-Za-zÄÖÜäöüéèàç0-9'&.\- ]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (name.length < 3 || !/[A-Za-zÄÖÜäöü]{3}/.test(name)) continue;
+      const prod = matchProduct(name);
+      if (!prod && !started) continue;           // vor der ersten echten Zeile nichts raten
+      started = true;
+      items.push({ q: +m[1], n: prod ? prod.n : titleCase(name), img: prod ? prod.img : '', c: prod ? prod.c : '', opt: '' });
+      continue;
+    }
+    // Zusatz-Zeile unter einem Produkt (z. B. „Knoblauch Sauce“)
+    if (started && items.length && /^[^\d]{3,40}$/.test(l) && !stop.test(l)) {
+      const ow = l.split(' ');
+      while (ow.length > 1 && (ow[0].length <= 2 || !/[A-Za-zÄÖÜäöü]/.test(ow[0]))) ow.shift();
+      const opt = ow.join(' ').replace(/[^A-Za-zÄÖÜäöüéèàç0-9'&.\- ]/g, '').trim();
+      if (opt.length >= 3 && /[a-zäöü]{3}/i.test(opt)) { const it = items[items.length - 1]; it.opt = it.opt ? it.opt + ', ' + opt : opt; }
+    }
+  }
+  return items;
+}
+const titleCase = s => s.toLowerCase().replace(/(^|\s)\S/g, c => c.toUpperCase());
+// Produkt aus der Speisekarte finden (tolerant gegenüber OCR-Fehlern)
+const FILL = /\b(pizza|pizzas|normal|klein|gross|familie|family|portion|stk|stueck|mit|und|extra)\b/g;
+const sizeNorm = s => s.replace(/\b0[.,]?5\s?l\b/g, '50cl').replace(/\b1[.,]5\s?l\b/g, '150cl').replace(/\b0[.,]?33\s?l\b/g, '33cl');
+function matchProduct(name) {
+  if (typeof PRODUCTS === 'undefined') return null;
+  const nn = norm(sizeNorm(name.toLowerCase())).replace(FILL, ' ').replace(/\s+/g, ' ').trim();
+  if (!nn) return null;
+  let best = null, bs = 0;
+  for (const p of PRODUCTS) {
+    const pn = norm(p.n).replace(FILL, ' ').replace(/\s+/g, ' ').trim() || norm(p.n);
+    let sc = 0;
+    if (norm(p.n) === norm(sizeNorm(name.toLowerCase()))) sc = 130;   // genau gleicher Name gewinnt immer
+    else if (pn === nn) sc = 100 - (norm(p.n).split(' ').length - pn.split(' ').length) * 8;
+    else if (nn.startsWith(pn + ' ') || nn === pn) sc = 70 + pn.length;           // „kebab scharf extra“ → „Kebab scharf“
+    else if (pn.startsWith(nn)) sc = 60 + nn.length;
+    else {
+      const a = new Set(nn.split(' ')), b = pn.split(' ');
+      const hit = b.filter(w => a.has(w) || [...a].some(x => x.length > 3 && lev(x, w) <= 1)).length;
+      // wie viele Wörter des Produkts sind auf dem Zettel? (Zusatzwörter kosten wenig)
+      sc = hit / b.length * 70 - Math.max(0, a.size - hit) * 4;
+      const d = lev(nn, pn); if (d <= Math.max(1, Math.floor(pn.length / 5))) sc = Math.max(sc, 85 - d * 5);
+    }
+    if (sc > bs) { bs = sc; best = p; }
+  }
+  return bs >= 45 ? best : null;
 }
 
 // ---------- Tour ----------
@@ -470,7 +536,7 @@ async function addOrderFromParsed(p) {
   const c = upsertCustomer({ street: p.street, plz: p.plz, ort, phone: p.phone, name: p.name });
   db.settings.lastOrt = ort;
   const o = { id: uid(), custId: c.id, amount: p.amount || '0', pay: p.pay || 'bar',
-    note: p.etage && p.etage !== '0' ? `Etage ${p.etage}` : '', time: p.time || '', ref: p.ref || '', done: false, addedAt: Date.now() };
+    note: p.etage && p.etage !== '0' ? `Etage ${p.etage}` : '', time: p.time || '', ref: p.ref || '', items: p.items || [], done: false, addedAt: Date.now() };
   db.tour.push(o); save();
   if (c.lat == null) {
     const g = await geocode(c.street, c.plz, c.ort);
@@ -629,6 +695,7 @@ function deliveredDialog(orderId) {
   const d = openDialog(`
     <h3>Geliefert ✓</h3>
     <p class="sub">${esc(addrLine(c))} · CHF ${fr(amt)} · ${payLabel(o.pay)}</p>
+    ${itemsHtml(o.items, true)}
     ${isCash ? `
       <label class="f">💵 Kunde gibt CHF</label>
       <div class="tips">${gives.map(v => `<button type="button" data-give="${v}">${v === amt ? 'Genau' : v}</button>`).join('')}</div>
@@ -730,70 +797,6 @@ function nextStopDialog() {
       <button class="btn" value="cancel" type="submit">Später</button>
     </div>`);
 }
-
-function customerDialog(id) {
-  const c = db.customers[id]; if (!c) return;
-  const st = custStats(c);
-  const pt = (p, name) => p ? `✓ gemerkt <a href="#" ${navPt(p, c.street)}>(hinfahren)</a>` : `<span class="sub">noch nicht gesetzt</span>`;
-  const d = openDialog(`
-    <h3>${esc(c.street)}</h3>
-    <p class="sub">${esc(c.plz)} ${esc(c.ort)} · ${st.n}× beliefert · Ø Trinkgeld ${fr(st.avgTip)}${st.last ? ' · zuletzt ' + dt(st.last) : ''}</p>
-    <label class="f">Merkmale</label>
-    <div class="tagpick">${TAGS.map(t => `<button type="button" class="${c.tags.includes(t) ? 'on' : ''}" data-tag="${esc(t)}">${esc(t)}</button>`).join('')}</div>
-    <label class="f" for="cNotes">Notiz</label>
-    <textarea id="cNotes" placeholder="z. B. 2. Stock links, Name steht „Muster“, beim Eingang Code 1234">${esc(c.notes)}</textarea>
-    <label class="f" for="cPhone">Telefon</label>
-    <div class="row"><input id="cPhone" type="tel" value="${esc(c.phone)}" style="flex:1">${c.phone ? `<a class="btn call" href="tel:${esc(c.phone)}">📞 Anrufen</a>` : ''}</div>
-    <label class="f">🅿️ Parkplatz: ${pt(c.park)}</label>
-    <div class="row"><button class="btn sm" data-pick="park" type="button">Auf Karte setzen</button><button class="btn sm" data-gps="park" type="button">Hier (GPS)</button>${c.park ? '<button class="btn sm danger" data-clear="park" type="button">Löschen</button>' : ''}</div>
-    <label class="f">🔔 Klingel / Eingang: ${pt(c.bell)}</label>
-    <div class="row"><button class="btn sm" data-pick="bell" type="button">Auf Karte setzen</button><button class="btn sm" data-gps="bell" type="button">Hier (GPS)</button>${c.bell ? '<button class="btn sm danger" data-clear="bell" type="button">Löschen</button>' : ''}</div>
-    <label class="f">🏠 Hauspunkt: ${c.lat != null ? '✓' : '<span class="warn">fehlt</span>'}</label>
-    <div class="row"><button class="btn sm" data-pick="house" type="button">Auf Karte korrigieren</button></div>
-    ${st.n ? `<label class="f">Verlauf</label><table class="t">${c.visits.slice(-8).reverse().map(v => `<tr><td>${dt(v.t)}</td><td class="r">CHF ${fr(v.amount)}</td><td class="r">+${fr(v.tip)}</td></tr>`).join('')}</table>` : ''}
-    <div class="foot">
-      <button class="btn danger" id="cDel" type="button">Löschen</button>
-      <button class="btn primary" id="cSave" type="button">Speichern</button>
-    </div>`);
-  const keep = () => { c.notes = $('#cNotes', d).value.trim(); c.phone = $('#cPhone', d).value.replace(/\s/g, ''); };
-  $$('[data-tag]', d).forEach(b => b.addEventListener('click', () => {
-    const t = b.dataset.tag; c.tags = c.tags.includes(t) ? c.tags.filter(x => x !== t) : [...c.tags, t]; b.classList.toggle('on');
-  }));
-  $$('[data-pick]', d).forEach(b => b.addEventListener('click', () => { keep(); save(); closeDialog(); startPick(b.dataset.pick, c.id); }));
-  $$('[data-gps]', d).forEach(b => b.addEventListener('click', async () => {
-    try { const p = await gps(); c[b.dataset.gps] = { lat: p.lat, lng: p.lng }; keep(); save(); toast(`Gespeichert (±${Math.round(p.acc)} m)`); customerDialog(c.id); }
-    catch (e) { toast('GPS nicht verfügbar'); }
-  }));
-  $$('[data-clear]', d).forEach(b => b.addEventListener('click', () => { c[b.dataset.clear] = null; keep(); save(); customerDialog(c.id); }));
-  $('#cSave', d).addEventListener('click', () => { keep(); save(); closeDialog(); refreshAll(); toast('Kunde gespeichert ✓'); });
-  $('#cDel', d).addEventListener('click', () => {
-    if (!confirm('Kunde mit allen Notizen löschen?')) return;
-    delete db.customers[c.id]; db.tour = db.tour.filter(o => o.custId !== c.id); save(); closeDialog(); refreshAll();
-  });
-}
-
-
-// ---------- Ansicht: Kunden ----------
-function renderKunden(q = '') {
-  const v = $('#view-kunden');
-  const list = Object.values(db.customers)
-    .filter(c => !q || norm(addrLine(c) + ' ' + c.notes + ' ' + c.phone).includes(norm(q)))
-    .sort((a, b) => (custStats(b).last || b.created) - (custStats(a).last || a.created));
-  const inp = $('#kq', v);
-  if (!inp) {
-    v.innerHTML = `<input id="kq" type="search" placeholder="Suchen: Strasse, Ort, Notiz, Telefon"><div id="klist" class="list mt"></div>`;
-    $('#kq', v).addEventListener('input', e => renderKunden(e.target.value));
-  }
-  $('#klist', v).innerHTML = list.length ? list.map(c => {
-    const st = custStats(c);
-    return `<button class="item" data-cust-open="${esc(c.id)}" type="button">
-      <div class="addr">${esc(c.street)}</div>
-      <div class="sub">${esc(c.plz)} ${esc(c.ort)} · ${st.n}× · Ø Trinkgeld ${fr(st.avgTip)} ${c.park ? '· 🅿️' : ''}${c.bell ? ' 🔔' : ''}${c.lat == null ? ' · ⚠️ kein Punkt' : ''}</div>
-      ${(c.tags || []).length ? `<div class="chips">${c.tags.map(x => `<span class="chip">${esc(x)}</span>`).join('')}</div>` : ''}
-    </button>`;
-  }).join('') : '<div class="empty">Noch keine Kunden. Sie entstehen automatisch, wenn du Bestellungen erfasst.</div>';
-}
-$('#view-kunden').addEventListener('click', e => { const b = e.target.closest('[data-cust-open]'); if (b) customerDialog(b.dataset.custOpen); });
 
 // ---------- Schicht & Abrechnung ----------
 function ensureShift() {
@@ -1028,6 +1031,117 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') db.settings.hiddenAt = Date.now(), save();
   else if (db.settings.pinHash && Date.now() - (db.settings.hiddenAt || 0) > 5 * 60000) lockApp();
 });
+
+// ---------- Gemeinsame Bausteine (v12 Design) ----------
+const ic = (name, fill) => `<i class="${fill ? 'ph-fill' : 'ph-bold'} ph-${name}" aria-hidden="true"></i>`;
+const TAG_ICON = {
+  'Klingel kaputt – anrufen': 'bell-slash', 'Hintereingang': 'door-open', 'Hund': 'dog', 'Viele Treppen': 'stairs',
+  'Kein Lift': 'elevator', 'Name nicht angeschrieben': 'identification-badge', 'Gutes Trinkgeld': 'coins',
+  'Zahlt mit Karte': 'credit-card', 'Schwer zu finden': 'map-pin-area', 'Parkieren schwierig': 'traffic-cone'
+};
+const initials = (c) => {
+  const src = (c.name || c.street || '?').replace(/[^A-Za-zÄÖÜäöüéè ]/g, ' ').trim().split(/\s+/);
+  return ((src[0] || '?')[0] + (src.length > 1 ? src[src.length - 1][0] : '')).toUpperCase();
+};
+// Produkte einer Bestellung: runde Subito-Bilder mit Anzahl
+function itemsHtml(items, big) {
+  if (!items || !items.length) return '';
+  return `<div class="items ${big ? 'big' : ''}">${items.map(it => `
+    <div class="it">
+      <span class="it-img">${it.img ? `<img src="${esc(it.img)}" alt="" loading="lazy" referrerpolicy="no-referrer-when-downgrade">` : ic('bowl-food')}<b>${it.q}</b></span>
+      <span class="it-t"><b>${esc(it.n)}</b>${it.opt ? `<small>${esc(it.opt)}</small>` : ''}</span>
+    </div>`).join('')}</div>`;
+}
+const itemsLine = items => (items || []).map(it => `${it.q}× ${it.n}`).join(' · ');
+
+// Kurze, dezente Meldung oben
+function toast(msg, ms = 2200) {
+  const t = $('#toast'); t.innerHTML = `${ic('check-circle', true)}<span>${esc(msg)}</span>`; t.classList.add('show');
+  clearTimeout(toast._h); toast._h = setTimeout(() => t.classList.remove('show'), ms);
+}
+
+// ---------- Kundenfenster (neu) ----------
+function customerDialog(id) {
+  const c = db.customers[id]; if (!c) return;
+  const st = custStats(c);
+  const spot = (key, label, icon) => {
+    const p = c[key];
+    return `<div class="spot ${p ? 'set' : ''}">
+      <span class="spot-ic">${ic(icon, true)}</span>
+      <div class="spot-t"><b>${label}</b><small>${p ? 'gemerkt' : 'noch nicht gesetzt'}</small></div>
+      <div class="spot-a">
+        ${p ? `<button type="button" class="ic" ${navPt(p, c.street)} aria-label="Hinfahren">${ic('navigation-arrow')}</button>` : ''}
+        <button type="button" class="ic" data-pick="${key}" aria-label="Auf Karte setzen">${ic('map-trifold')}</button>
+        <button type="button" class="ic" data-gps="${key}" aria-label="Hier per GPS">${ic('crosshair')}</button>
+        ${p ? `<button type="button" class="ic del" data-clear="${key}" aria-label="Löschen">${ic('x')}</button>` : ''}
+      </div></div>`;
+  };
+  const d = openDialog(`
+    <div class="cd-head">
+      <span class="av">${esc(initials(c))}</span>
+      <div class="cd-title"><b>${esc(c.name || c.street)}</b><small>${c.name ? esc(c.street) + ' · ' : ''}${esc(c.plz)} ${esc(c.ort)}</small></div>
+      ${c.phone ? `<a class="ic big dark" href="tel:${esc(c.phone)}" aria-label="Anrufen">${ic('phone', true)}</a>` : ''}
+    </div>
+    <div class="cd-stats">
+      <span><b>${st.n}×</b> beliefert</span><span><b>${fr(st.avgTip)}</b> Ø Trinkgeld</span><span><b>${st.last ? dt(st.last) : '–'}</b> zuletzt</span>
+    </div>
+    <h2>Hinweise</h2>
+    <div class="tagtiles">${TAGS.map(t => `<button type="button" class="tt ${c.tags.includes(t) ? 'on' : ''}" data-tag="${esc(t)}">${ic(TAG_ICON[t] || 'tag')}<span>${esc(t.replace(' – anrufen', ''))}</span></button>`).join('')}</div>
+    <h2>Notiz</h2>
+    <textarea id="cNotes" placeholder="z. B. 2. Stock links · Code 1234">${esc(c.notes)}</textarea>
+    <h2>Telefon</h2>
+    <input id="cPhone" type="tel" inputmode="tel" value="${esc(c.phone)}" placeholder="079 123 45 67">
+    <h2>Orte</h2>
+    ${spot('park', 'Parkplatz', 'car-profile')}
+    ${spot('bell', 'Klingel / Eingang', 'door')}
+    <button type="button" class="linkbtn" data-pick="house">${ic('map-pin-area')} Hauspunkt auf Karte korrigieren</button>
+    ${st.n ? `<details class="acc"><summary>Verlauf · ${st.n}</summary><table class="t">${c.visits.slice(-10).reverse().map(v => `<tr><td>${dt(v.t)}</td><td class="r">CHF ${fr(v.amount)}</td><td class="r">+${fr(v.tip)}</td></tr>`).join('')}</table></details>` : ''}
+    <div class="foot sticky">
+      <button class="btn" value="cancel" type="submit">Zurück</button>
+      <button class="btn primary" id="cSave" type="button">${ic('check')} Speichern</button>
+    </div>
+    <button class="linkbtn danger" id="cDel" type="button">${ic('trash')} Kunde löschen</button>`);
+  const keep = () => { c.notes = $('#cNotes', d).value.trim(); c.phone = $('#cPhone', d).value.replace(/\s/g, ''); };
+  $$('[data-tag]', d).forEach(b => b.addEventListener('click', () => {
+    const t = b.dataset.tag; c.tags = c.tags.includes(t) ? c.tags.filter(x => x !== t) : [...c.tags, t]; b.classList.toggle('on'); navigator.vibrate?.(10);
+  }));
+  $$('[data-pick]', d).forEach(b => b.addEventListener('click', () => { keep(); save(); closeDialog(); startPick(b.dataset.pick, c.id); }));
+  $$('[data-gps]', d).forEach(b => b.addEventListener('click', async () => {
+    try { const p = lastPos && Date.now() - (lastPos.t || 0) < 30000 ? lastPos : await gps(); c[b.dataset.gps] = { lat: p.lat, lng: p.lng }; keep(); save(); toast(`Gespeichert · ±${Math.round(p.acc || 0)} m`); customerDialog(c.id); }
+    catch (e) { toast('GPS nicht verfügbar'); }
+  }));
+  $$('[data-clear]', d).forEach(b => b.addEventListener('click', () => { c[b.dataset.clear] = null; keep(); save(); customerDialog(c.id); }));
+  $('#cSave', d).addEventListener('click', () => { keep(); save(); closeDialog(); refreshAll(); toast('Gespeichert'); });
+  $('#cDel', d).addEventListener('click', () => {
+    if (!confirm('Kunde mit allen Notizen löschen?')) return;
+    delete db.customers[c.id]; db.tour = db.tour.filter(o => o.custId !== c.id); save(); closeDialog(); refreshAll();
+  });
+}
+
+// ---------- Kundenliste (neu) ----------
+function renderKunden(q = '') {
+  const v = $('#view-kunden');
+  const list = Object.values(db.customers)
+    .filter(c => !q || norm(addrLine(c) + ' ' + (c.name || '') + ' ' + c.notes + ' ' + c.phone).includes(norm(q)))
+    .sort((a, b) => (custStats(b).last || b.created) - (custStats(a).last || a.created));
+  if (!$('#kq', v)) {
+    v.innerHTML = `<div class="vh-row"><h1 class="vh">Kunden</h1><button class="ic big" type="button" data-back aria-label="Zurück">${ic('x')}</button></div>
+      <div class="searchbox">${ic('magnifying-glass')}<input id="kq" type="search" placeholder="Name, Strasse, Ort, Notiz"></div>
+      <div id="klist" class="clist"></div>`;
+    $('#kq', v).addEventListener('input', e => renderKunden(e.target.value));
+    $('[data-back]', v).addEventListener('click', () => showView('einst'));
+  }
+  $('#klist', v).innerHTML = list.length ? list.map(c => {
+    const st = custStats(c);
+    return `<button class="crow" data-cust-open="${esc(c.id)}" type="button">
+      <span class="av sm">${esc(initials(c))}</span>
+      <span class="crow-b"><b>${esc(c.name || c.street)}</b><small>${c.name ? esc(c.street) + ' · ' : ''}${esc(c.ort)}</small>
+        ${(c.tags || []).length ? `<span class="crow-tags">${c.tags.slice(0, 4).map(t => ic(TAG_ICON[t] || 'tag')).join('')}</span>` : ''}</span>
+      <span class="crow-n"><b>${st.n}×</b><small>${fr(st.avgTip)}</small></span>
+    </button>`;
+  }).join('') : '<div class="empty">Noch keine Kunden. Sie entstehen automatisch beim Scannen.</div>';
+}
+$('#view-kunden').addEventListener('click', e => { const b = e.target.closest('[data-cust-open]'); if (b) customerDialog(b.dataset.custOpen); });
 
 // =====================================================================
 //  v10 – NEUE OBERFLÄCHE: Karte (search.ch) · GPS-Tracker · Kamera · Liste
@@ -1319,23 +1433,28 @@ function cardHtml() {
   const { o, c } = tg, i = open.indexOf(o);
   const arrived = isArrived(o, c), late = lateBy(o), eta = lastRoute?.eta?.[o.id];
   const cash = o.pay === 'bar' && +o.amount > 0;
+  const [rMin, rKm] = (route.txt || '').split(' · ');
   return `<div class="cs ${arrived ? 'arrived' : ''} ${late > 0 ? 'late' : ''}">
-    <div class="cs-head">
+    <div class="cs-top">
+      <div class="cs-eta">${arrived ? `${ic('map-pin', true)}<b>Angekommen</b>` : route.txt ? `${ic('car-profile', true)}<b>${esc(rMin)}</b><span>${esc(rKm || '')}</span>` : `<span class="spin"></span><span>Route…</span>`}</div>
+      ${late > 0 ? `<span class="tag-late">${ic('clock', true)} ${late}′ spät</span>` : eta ? `<span class="tag-time">an ${tm(eta)}</span>` : ''}
+      ${open.length > 1 ? `<div class="cs-pager"><button type="button" data-act="prev" aria-label="Vorheriger">${ic('caret-left')}</button><span>${i + 1}/${open.length}</span><button type="button" data-act="next" aria-label="Nächster">${ic('caret-right')}</button></div>` : ''}
+    </div>
+    <div class="cs-addr">
       <span class="cs-num">${i + 1}</span>
-      <div class="cs-title"><b>${esc(c.street)}</b><small>${esc(c.plz)} ${esc(c.ort)}${c.name ? ' · ' + esc(c.name) : ''}</small></div>
-      ${open.length > 1 ? `<div class="cs-pager"><button type="button" data-act="prev" aria-label="Vorheriger">‹</button><span>${i + 1}/${open.length}</span><button type="button" data-act="next" aria-label="Nächster">›</button></div>` : ''}
+      <div class="cs-title"><b>${esc(c.street)}</b><small>${esc(c.plz)} ${esc(c.ort)}${o.time ? ` · <b class="due">bis ${esc(o.time)}</b>` : ''}${c.name ? ' · ' + esc(c.name) : ''}</small></div>
     </div>
-    <div class="cs-route">${arrived ? '<b class="arr">📍 Angekommen</b>' : route.txt ? `🚗 <b>${esc(route.txt)}</b>` : '🚗 Route wird berechnet…'}${eta ? ` · an <b>${tm(eta)}</b>` : ''}${o.time ? ` · 🕗 ${esc(o.time)}` : ''}${late > 0 ? ` · <span class="lt">${late}′ zu spät</span>` : ''}</div>
+    ${itemsHtml(o.items)}
     <div class="cs-info">
-      <span class="pill ${cash ? 'cash' : ''}">${cash ? `💵 ${fr(o.amount)} kassieren` : `${payLabel(o.pay)} · ${fr(o.amount)}`}</span>
-      ${arrived ? (c.tags || []).map(t => `<span class="pill warn">${esc(t)}</span>`).join('') : (c.tags || []).length ? `<span class="pill warn">⚠️ ${c.tags.length}</span>` : ''}
-      ${arrived && o.note ? `<span class="pill">🧾 ${esc(o.note)}</span>` : ''}
+      <span class="pill ${cash ? 'cash' : ''}">${cash ? `${ic('money', true)} ${fr(o.amount)} kassieren` : `${ic(o.pay === 'karte' ? 'credit-card' : 'check-circle', true)} ${o.pay === 'online' ? 'Bezahlt' : payLabel(o.pay)} · ${fr(o.amount)}`}</span>
+      ${(c.tags || []).map(t => `<span class="pill warn" title="${esc(t)}">${ic(TAG_ICON[t] || 'warning')}${arrived ? ' ' + esc(t.replace(' – anrufen', '')) : ''}</span>`).join('')}
+      ${arrived && o.note ? `<span class="pill">${ic('note-pencil')} ${esc(o.note)}</span>` : ''}
     </div>
-    ${arrived && c.notes ? `<div class="cs-note">📝 ${esc(c.notes)}</div>` : ''}
+    ${arrived && c.notes ? `<div class="cs-note">${ic('note-pencil')} ${esc(c.notes)}</div>` : ''}
     <div class="cs-btns">
-      ${c.phone ? `<a class="btn call" href="tel:${esc(c.phone)}">${late > 0 ? '📞 Bescheid geben' : '📞'}</a>` : ''}
-      <button class="btn primary big ${arrived ? 'pulse' : ''}" type="button" data-done="${o.id}">✓ Geliefert</button>
-      <button class="btn" type="button" data-cust="${esc(c.id)}" aria-label="Kunde">⋯</button>
+      ${c.phone ? `<a class="btn call" href="tel:${esc(c.phone)}" aria-label="Anrufen">${ic('phone', true)}${late > 0 ? ' Bescheid' : ''}</a>` : ''}
+      <button class="btn primary big ${arrived ? 'pulse' : ''}" type="button" data-done="${o.id}">${ic('check-circle', true)} Geliefert</button>
+      <button class="btn more" type="button" data-cust="${esc(c.id)}" aria-label="Kunde">${ic('dots-three')}</button>
     </div>
   </div>`;
 }
@@ -1540,20 +1659,34 @@ function renderList() {
   const tg = currentTarget();
   v.innerHTML = `
     <div class="vh-row"><h1 class="vh">Liste</h1>
-      <div>${open.length > 1 ? '<button class="ic big" type="button" data-act="opt" aria-label="Neu sortieren">⚡</button>' : ''}<button class="ic big dark" type="button" data-act="add" aria-label="Von Hand">＋</button></div></div>
-    ${open.length ? `<p class="hint">${open.length} offen · CHF ${fr(sum)}${cash ? ` · 💵 ${fr(cash)} bar` : ''}</p>` : ''}
+      <div>${open.length > 1 ? `<button class="ic big" type="button" data-act="opt" aria-label="Neu sortieren">${ic('lightning', true)}</button>` : ''}<button class="ic big dark" type="button" data-act="add" aria-label="Von Hand">${ic('plus')}</button></div></div>
+    ${open.length ? `<p class="hint">${open.length} offen · CHF ${fr(sum)}${cash ? ` · ${ic('money', true)} ${fr(cash)} bar` : ''}</p>` : ''}
     ${open.length ? `<ol class="rows">${open.map((o, i) => {
       const c = db.customers[o.custId] || {}, late = lateBy(o), eta = lastRoute?.eta?.[o.id], isT = tg && tg.o && tg.o.id === o.id;
       return `<li class="rw ${isT ? 'now' : ''}" data-go="${o.id}">
         <span class="rw-n ${late > 0 ? 'late' : ''}">${i + 1}</span>
-        <div class="rw-b"><b>${esc(c.street)}</b><small>${esc(c.ort)} · ${o.pay === 'bar' ? '💵 ' + fr(o.amount) : payLabel(o.pay)}${o.time ? ' · 🕗 ' + esc(o.time) : ''}${eta ? ' · an ' + tm(eta) : ''}${late > 0 ? ` · <span class="lt">${late}′ spät</span>` : ''}${c.lat == null ? ' · <span class="lt">⚠️ Punkt?</span>' : ''}</small></div>
-        <div class="rw-a">${c.phone ? `<a class="ic" href="tel:${esc(c.phone)}" aria-label="Anrufen">📞</a>` : ''}<button class="ic" type="button" data-cust="${esc(c.id)}" aria-label="Kunde">⋯</button><button class="ic del" type="button" data-del="${o.id}" aria-label="Entfernen">✕</button></div>
+        <div class="rw-b"><b>${esc(c.street)}</b>${(o.items || []).length ? `<span class="rw-it">${o.items.slice(0, 4).map(it => it.img ? `<img src="${esc(it.img)}" alt="" loading="lazy">` : '').join('')}<em>${esc(itemsLine(o.items))}</em></span>` : ''}<small>${esc(c.ort)} · ${o.pay === 'bar' ? ic('money', true) + ' ' + fr(o.amount) : payLabel(o.pay)}${o.time ? ' · bis ' + esc(o.time) : ''}${eta ? ' · an ' + tm(eta) : ''}${late > 0 ? ` · <span class="lt">${late}′ spät</span>` : ''}${c.lat == null ? ' · <span class="lt">⚠️ Punkt?</span>' : ''}</small></div>
+        <div class="rw-a">${c.phone ? `<a class="ic" href="tel:${esc(c.phone)}" aria-label="Anrufen">${ic('phone', true)}</a>` : ''}<button class="ic" type="button" data-menu="${o.id}" aria-label="Mehr">${ic('dots-three')}</button></div>
       </li>`;
     }).join('')}</ol>` : '<div class="empty">Keine offenen Lieferungen.<br>Tippe unten auf 📷 und fotografiere die Zettel.</div>'}
     ${done.length ? `<h2>Erledigt (${done.length})</h2><ol class="rows done">${done.map(o => { const c = db.customers[o.custId] || {}; return `<li class="rw"><span class="rw-n">✓</span><div class="rw-b"><b>${esc(c.street)}</b><small>${esc(c.ort)} · CHF ${fr(o.amount)} · Trinkgeld ${fr(o.tip)}</small></div></li>`; }).join('')}</ol>
       <button class="btn block" type="button" data-act="cleardone">Erledigte entfernen</button>` : ''}`;
 }
 $('#view-liste').addEventListener('click', e => {
+  const mn = e.target.closest('[data-menu]');
+  if (mn) {
+    const o = db.tour.find(x => x.id === mn.dataset.menu), c = o && db.customers[o.custId]; if (!o) return;
+    const d = openDialog(`<h3>${esc(c?.street || '')}</h3>${itemsHtml(o.items, true)}
+      <div class="bigbtns">
+        <button class="btn primary" type="button" data-m="go">${ic('navigation-arrow', true)} Jetzt hinfahren</button>
+        <button class="btn" type="button" data-m="cust">${ic('user-circle')} Kunde & Notizen</button>
+        <button class="btn danger" type="button" data-m="del">${ic('trash')} Aus der Tour entfernen</button>
+      </div>`);
+    d.querySelector('[data-m="go"]').onclick = () => { closeDialog(); goTo(o.id); };
+    d.querySelector('[data-m="cust"]').onclick = () => { closeDialog(); customerDialog(o.custId); };
+    d.querySelector('[data-m="del"]').onclick = () => { closeDialog(); db.tour = db.tour.filter(x => x.id !== o.id); setRoute(null); save(); autoRoute(100); renderAll(); toast('Entfernt'); };
+    return;
+  }
   const cu = e.target.closest('[data-cust]'); if (cu) { customerDialog(cu.dataset.cust); return; }
   const del = e.target.closest('[data-del]'); if (del) { if (confirm('Lieferung entfernen?')) { db.tour = db.tour.filter(o => o.id !== del.dataset.del); setRoute(null); save(); autoRoute(100); renderAll(); } return; }
   if (e.target.closest('a')) return;
